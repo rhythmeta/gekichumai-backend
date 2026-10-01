@@ -27,6 +27,8 @@ The Worker requires a D1 `DB` binding and an R2 `BACKUP_BUCKET` binding. Public 
 
 The repository workflow validates every pull request. Production deployment is manually dispatched and requires `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` repository or organization secrets. R2 S3 credentials remain Worker secrets; a narrowly scoped token needs Workers deployment, D1 and R2 access.
 
+The API zone route `api.rhythmeta.org/*` is already provisioned and is managed separately from application deployment. `wrangler.jsonc` intentionally omits production routes so the organization deployment token does not need Zone Routes permission. Keep the existing DNS record proxied. To reprovision the route, use an authorized Cloudflare account and `wrangler deploy --env="" --route "api.rhythmeta.org/*" --x-route-zones --zone-id 3842c59d03b6d2d937b84f679b3bdb8b`.
+
 The minute cron settles closed alias votes and removes deleted/expired snapshots. Upload staging objects use `backup-uploads/`; configure a one-day R2 lifecycle expiry on that prefix, including objects re-uploaded through a still-valid five-minute upload URL. Final objects use `backups/{game}/{random UUID}.pb.gz`. Never cache either prefix at the public domain. All object responses carry `Cache-Control: no-store`.
 
 Public download URLs are bearer links, as selected for this project. They must not appear in invocation logs, analytics or referrers. Authenticated routes control listing, upload, commit and deletion. A staging object and its committed object have different keys, so a reusable upload URL cannot overwrite a committed snapshot.

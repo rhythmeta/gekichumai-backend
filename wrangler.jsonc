@@ -8,12 +8,8 @@
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
-  "routes": [
-    {
-      "pattern": "api.rhythmeta.org/*",
-      "zone_id": "3842c59d03b6d2d937b84f679b3bdb8b",
-    },
-  ],
+  // api.rhythmeta.org/* is an existing zone route managed separately.
+  // Omitting routes lets application deploys retain it without Zone Routes permission.
   "preview_urls": false,
   "observability": {
     "enabled": true,

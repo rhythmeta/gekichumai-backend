@@ -3,7 +3,7 @@
 ## Production
 
 - The owner confirmed the old PostgreSQL service stopped accepting writes and authorized the existing archive for final import.
-- API: https://api.rhythmeta.org, Worker `rhythmeta-backend`, native D1 `rhythmeta` (`8cf164dd-0277-4860-ba58-595ed35df784`). The zone route `api.rhythmeta.org/*` intercepts the existing proxied DNS record.
+- API: https://api.rhythmeta.org, Worker `rhythmeta-backend`, native D1 `rhythmeta` (`8cf164dd-0277-4860-ba58-595ed35df784`). The existing zone route `api.rhythmeta.org/*` invokes this Worker; the stopped origin is not used.
 - Dashboard: https://dash.rhythmeta.org, Worker `rhythmeta-dashboard`, Next.js static export with a custom domain.
 - Imported 204 accounts, 2 TOTP credentials, 3 passkeys, 20 recovery codes, 54 approved community aliases, 123 candidates and 317 votes. An additional 64 rejected-alias tombstones preserve revocation behavior. Foreign-key and SQLite integrity checks pass. Scheduled settlement resumes after deployment, so candidate status totals can subsequently change.
 - Original archive SHA-256: `a5a809531f64b541b2c5bc07b1c557188b5ed048575aaa11ca3d3373c77ca007`. Private import material is excluded from Git.
@@ -28,4 +28,5 @@
 - Cloudflare API token/account ID supplied through organization Actions secrets. Backend application/R2 secrets are configured in the backend repository.
 - Staging API/dashboard use `rhythmeta-backend-staging.cqbe.workers.dev` and `rhythmeta-dashboard-staging.cqbe.workers.dev`; D1 staging is isolated from production. Two example.invalid test accounts exist only for staging verification.
 - Keep the original archive and stopped Docker service available for rollback. Reverting DNS/route alone does not merge newly created D1 accounts or aliases back into PostgreSQL; export and reconcile post-cutover writes before any rollback.
-- The API route relies on the existing proxied DNS record. Keep that record proxied until the API is moved to a Worker custom domain.
+- Both repositories are public at the owner’s request so organization-level deployment Secrets are available on the current GitHub plan.
+- API routing is managed separately from application deployments because the deployment token lacks Zone Routes permission. The existing proxied DNS record must remain; its origin need not run. Worker Custom Domain attachment was rejected because that DNS record already exists.
