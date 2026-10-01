@@ -22,8 +22,8 @@
 
 ## Repositories and operations
 
-- https://github.com/rhythmeta/rhythmeta-backend
-- https://github.com/rhythmeta/rhythmeta-dashboard
+- https://github.com/rhythmeta/gekichumai-backend
+- https://github.com/rhythmeta/gekichumai-dashboard
 - Both extracted repositories preserve their original subtree histories. Validation runs on pushes/PRs; production deployment is manually dispatched.
 - Cloudflare API token/account ID supplied through organization Actions secrets. Backend application/R2 secrets are configured in the backend repository.
 - Temporary staging Workers and D1 were removed after verification, including test accounts and imported credential copies. No ready/pending staging backup objects remained. Production smoke-test accounts and R2 objects were also removed; production remains at 204 accounts, 2 TOTP credentials, 3 passkeys and 20 recovery codes.
