@@ -3,7 +3,7 @@
   "alias": {
     "@serenity-kit/opaque": "./.worker-vendor/opaque.js",
   },
-  "name": "rhythmeta-backend",
+  "name": "gekichumai-backend",
   "main": "src/worker.ts",
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -29,7 +29,7 @@
   "r2_buckets": [
     {
       "binding": "BACKUP_BUCKET",
-      "bucket_name": "maimaid-assets",
+      "bucket_name": "gekichumai-backups",
     },
   ],
   "triggers": {

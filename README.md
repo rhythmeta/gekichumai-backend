@@ -1,6 +1,6 @@
 # Rhythmeta backend
 
-Shared Rhythmeta accounts, game-scoped community aliases and manual cloud backups for maimaid and chunithmd. Runs on Cloudflare Workers, D1 and the existing public R2 bucket.
+Shared Rhythmeta accounts, game-scoped community aliases and manual cloud backups for maimaid and chunithmd. Runs on Cloudflare Workers, D1 and the dedicated public R2 bucket `gekichumai-backups`.
 
 - `/auth/v1`: OPAQUE/legacy bcrypt login, email verification/reset, MFA/passkeys, refresh tokens and PKCE app handoff.
 - `/{maimaid,chunithmd}/v1/community`: aliases, voting and moderation.
@@ -23,7 +23,7 @@ Generate a development OPAQUE setup with `@serenity-kit/opaque`; never regenerat
 
 ## Deploy
 
-The Worker requires a D1 `DB` binding and an R2 `BACKUP_BUCKET` binding. Public settings and binding IDs are in `wrangler.jsonc`. Set the secrets listed in `.dev.vars.example` with `wrangler secret bulk`. Keep the existing OPAQUE setup and `WEBAUTHN_RP_ID=rhythmeta.org`. The dashboard origin is `https://dash.rhythmeta.org`.
+The `gekichumai-backend` Worker requires a D1 `DB` binding and an R2 `BACKUP_BUCKET` binding. Public settings and binding IDs are in `wrangler.jsonc`. Set `S3_BUCKET=gekichumai-backups` and `S3_PUBLIC_BASE_URL=https://backups.rhythmeta.org`; the S3 credentials must grant Object Read & Write to this bucket. Set the secrets listed in `.dev.vars.example` with `wrangler secret bulk`. Keep the existing OPAQUE setup and `WEBAUTHN_RP_ID=rhythmeta.org`. The dashboard origin is `https://dash.rhythmeta.org`.
 
 The repository workflow validates every pull request. Production deployment is manually dispatched and requires `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` repository or organization secrets. R2 S3 credentials remain Worker secrets; a narrowly scoped token needs Workers deployment, D1 and R2 access.
 

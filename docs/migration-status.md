@@ -3,13 +3,13 @@
 ## Production
 
 - The owner confirmed the old PostgreSQL service stopped accepting writes and authorized the existing archive for final import.
-- API: https://api.rhythmeta.org, Worker `rhythmeta-backend`, native D1 `rhythmeta` (`8cf164dd-0277-4860-ba58-595ed35df784`). The existing zone route `api.rhythmeta.org/*` invokes this Worker; the stopped origin is not used.
-- Dashboard: https://dash.rhythmeta.org, Worker `rhythmeta-dashboard`, Next.js static export with a custom domain.
+- API: https://api.rhythmeta.org, Worker `gekichumai-backend`, native D1 `rhythmeta` (`8cf164dd-0277-4860-ba58-595ed35df784`). The existing zone route `api.rhythmeta.org/*` invokes this Worker; the stopped origin is not used.
+- Dashboard: https://dash.rhythmeta.org, Worker `gekichumai-dashboard`, Next.js static export with a custom domain.
 - Imported 204 accounts, 2 TOTP credentials, 3 passkeys, 20 recovery codes, 54 approved community aliases, 123 candidates and 317 votes. An additional 64 rejected-alias tombstones preserve revocation behavior. Foreign-key and SQLite integrity checks pass. Scheduled settlement resumes after deployment, so candidate status totals can subsequently change.
 - Original archive SHA-256: `a5a809531f64b541b2c5bc07b1c557188b5ed048575aaa11ca3d3373c77ca007`. Private import material is excluded from Git.
 - OPAQUE setup and passkey RP ID `rhythmeta.org` preserved. New JWT secret invalidates legacy sessions. Apps use S256 PKCE with exact registered callbacks and single-use codes.
 - Legacy `/v1/*` returns 410. Cloud profiles/scores/imports/collections/multiplayer are retired; only accounts and community data were imported.
-- Public R2 bucket `maimaid-assets` holds protobuf+gzip backups at random UUID keys. Authenticated management, signed upload, immutable verified commit, latest three per game/user, 64 MiB compressed/512 MiB raw. A one-day lifecycle rule covers `backup-uploads/`; public responses use no-store.
+- Dedicated public R2 bucket `gekichumai-backups` (https://backups.rhythmeta.org) holds protobuf+gzip backups at random UUID keys. Authenticated management, signed upload, immutable verified commit, latest three per game/user, 64 MiB compressed/512 MiB raw. A one-day lifecycle rule covers `backup-uploads/`; public responses use no-store.
 
 ## Validation
 
