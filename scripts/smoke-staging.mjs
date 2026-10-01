@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import { gunzipSync } from "node:zlib";
-const base =
-  process.env.RHYTHMETA_SMOKE_BASE ??
-  "https://rhythmeta-backend-staging.cqbe.workers.dev";
+const base = process.env.RHYTHMETA_SMOKE_BASE;
+assert(
+  base,
+  "Set RHYTHMETA_SMOKE_BASE to an isolated test deployment with the example.invalid fixture users.",
+);
 let token;
 async function request(path, method = "GET", body, expected = 200) {
   const response = await fetch(`${base}/${path}`, {

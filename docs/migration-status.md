@@ -26,7 +26,14 @@
 - https://github.com/rhythmeta/rhythmeta-dashboard
 - Both extracted repositories preserve their original subtree histories. Validation runs on pushes/PRs; production deployment is manually dispatched.
 - Cloudflare API token/account ID supplied through organization Actions secrets. Backend application/R2 secrets are configured in the backend repository.
-- Staging API/dashboard use `rhythmeta-backend-staging.cqbe.workers.dev` and `rhythmeta-dashboard-staging.cqbe.workers.dev`; D1 staging is isolated from production. Two example.invalid test accounts exist only for staging verification.
+- Temporary staging Workers and D1 were removed after verification, including test accounts and imported credential copies. No ready/pending staging backup objects remained. Production smoke-test accounts and R2 objects were also removed; production remains at 204 accounts, 2 TOTP credentials, 3 passkeys and 20 recovery codes.
 - Keep the original archive and stopped Docker service available for rollback. Reverting DNS/route alone does not merge newly created D1 accounts or aliases back into PostgreSQL; export and reconcile post-cutover writes before any rollback.
 - Both repositories are public at the owner’s request so organization-level deployment Secrets are available on the current GitHub plan.
 - API routing is managed separately from application deployments because the deployment token lacks Zone Routes permission. The existing proxied DNS record must remain; its origin need not run. Worker Custom Domain attachment was rejected because that DNS record already exists.
+
+## Published client changes
+
+- maimaid: https://github.com/rhythmeta/maimaid/pull/3
+- chunithmd: https://github.com/rhythmeta/chunithmd/pull/1
+- Both PRs are ready for review. Local native builds/tests passed; remote native packaging checks were still running at handoff. Native apps have not been released.
+- Backend and dashboard validation and production deployments passed in GitHub Actions using organization Cloudflare secrets.

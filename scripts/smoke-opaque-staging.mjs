@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import * as opaque from "@serenity-kit/opaque";
 await opaque.ready;
-const base =
-  process.env.RHYTHMETA_SMOKE_BASE ??
-  "https://rhythmeta-backend-staging.cqbe.workers.dev";
+const base = process.env.RHYTHMETA_SMOKE_BASE;
+assert(
+  base,
+  "Set RHYTHMETA_SMOKE_BASE to an isolated test deployment with the example.invalid fixture users.",
+);
 const password = "Migration-test123!",
   email = "migration-opaque@example.invalid";
 async function post(path, body) {
