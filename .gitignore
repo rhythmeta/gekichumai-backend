@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.wrangler/
+.migration/
+.dev.vars*
+.env*
+!.env.example
+coverage/
+*.tsbuildinfo
+.worker-vendor/
+
+!.dev.vars.example

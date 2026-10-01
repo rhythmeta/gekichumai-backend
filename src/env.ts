@@ -1,70 +1,38 @@
 import { z } from "zod";
-
-/** Treats a blank value the same as an absent one. */
-const optionalString = z
-	.string()
-	.optional()
-	.transform((value) => {
-		const trimmed = value?.trim();
-		return trimmed ? trimmed : undefined;
-	});
-
-const EnvSchema = z.object({
-	NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-	HOST: z.string().min(1).default("0.0.0.0"),
-	PORT: z.coerce.number().int().positive().default(8787),
-	APP_PUBLIC_URL: z.url().optional(),
-	CORS_ALLOWED_ORIGINS: z.string().default(""),
-	DIVING_FISH_OAUTH_CLIENT_ID: z.string().min(1).default("5b79b87f22855b80ee35243eeec07916"),
-	DIVING_FISH_OAUTH_CLIENT_SECRET: optionalString,
-	DATABASE_URL: z.string().min(1),
-	JWT_ISSUER: z.string().min(1).default("maimaid-backend"),
-	JWT_AUDIENCE: z.string().min(1).default("maimaid-clients"),
-	JWT_ACCESS_SECRET: z.string().min(16),
-	JWT_ACCESS_TTL_SECONDS: z.coerce.number().int().positive().default(900),
-	JWT_REFRESH_TTL_SECONDS: z.coerce
-		.number()
-		.int()
-		.positive()
-		.default(60 * 60 * 24 * 30),
-	OPAQUE_SERVER_SETUP: z.string().min(1),
-	MFA_CHALLENGE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
-	WEBAUTHN_RP_ID: z.string().optional(),
-	WEBAUTHN_RP_NAME: z.string().default("maimaid"),
-	WEBAUTHN_ORIGIN: z.url().optional(),
-	RESEND_API_KEY: z.string().optional(),
-	RESEND_FROM_EMAIL: z.email().default("no-reply@example.com"),
-	// `.env` files carry these as empty strings when unset rather than omitting
-	// them, and "" is not the same as undefined downstream: S3_PUBLIC_ENDPOINT is
-	// read as `S3_PUBLIC_ENDPOINT ?? S3_ENDPOINT`, so an empty value would win the
-	// `??` and silently disable storage even with valid credentials.
-	S3_ENDPOINT: optionalString,
-	// Only for setups that sign on one host and serve on another, as MinIO did.
-	// R2 uses one host, so leave it unset there.
-	S3_PUBLIC_ENDPOINT: optionalString,
-	// R2 only accepts "auto".
-	S3_REGION: z.string().default("auto"),
-	S3_BUCKET: z.string().min(1).default("maimaid-assets"),
-	S3_ACCESS_KEY_ID: optionalString,
-	S3_SECRET_ACCESS_KEY: optionalString,
-	CATALOG_SOURCE_URL: z.url().optional(),
-	// Runs the consumer for catalog and community maintenance jobs enqueued by
-	// pg_cron. Off by default so deployments can use a dedicated dispatcher.
-	JOB_DISPATCHER_ENABLED: z
-		.enum(["true", "false"])
-		.default("false")
-		.transform((value) => value === "true"),
-	JOB_DISPATCHER_INTERVAL_SECONDS: z.coerce.number().int().positive().default(60),
-	JOB_DISPATCHER_BATCH_SIZE: z.coerce.number().int().positive().max(50).default(5),
-	// Shared secret for `/internal/*`, so the GitHub Actions bundle builder can
-	// authenticate without holding a user account. Unset means those routes accept
-	// only an admin JWT, exactly as before. Long enough that guessing is not a
-	// concern, since this grants what an admin token grants on those routes.
-	INTERNAL_JOB_TOKEN: optionalString.refine((value) => value === undefined || value.length >= 32, {
-		message: "INTERNAL_JOB_TOKEN must be at least 32 characters.",
-	}),
+const optional = z
+  .string()
+  .optional()
+  .transform((value) => value?.trim() || undefined);
+const schema = z.object({
+  NODE_ENV: z.string().default("production"),
+  PORT: z.coerce.number().default(8787),
+  APP_PUBLIC_URL: z.url().default("https://dash.rhythmeta.org"),
+  CORS_ALLOWED_ORIGINS: z.string().default("https://dash.rhythmeta.org"),
+  JWT_ISSUER: z.string().default("https://api.rhythmeta.org/auth/v1"),
+  JWT_AUDIENCE: z.string().default("rhythmeta-clients"),
+  JWT_ACCESS_SECRET: z.string().min(32),
+  JWT_ACCESS_TTL_SECONDS: z.coerce.number().int().positive().default(900),
+  JWT_REFRESH_TTL_SECONDS: z.coerce.number().int().positive().default(2592000),
+  OPAQUE_SERVER_SETUP: z.string().min(1),
+  MFA_CHALLENGE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+  WEBAUTHN_RP_ID: z.string().default("rhythmeta.org"),
+  WEBAUTHN_RP_NAME: z.string().default("Rhythmeta"),
+  WEBAUTHN_ORIGIN: z.url().default("https://dash.rhythmeta.org"),
+  LEGACY_WEBAUTHN_RP_ID: optional,
+  LEGACY_WEBAUTHN_ORIGIN: optional,
+  LEGACY_WEBAUTHN_UNTIL: optional,
+  RESEND_API_KEY: optional,
+  RESEND_FROM_EMAIL: z.email().default("no-reply@rhythmeta.org"),
+  S3_ENDPOINT: z.url(),
+  S3_REGION: z.string().default("auto"),
+  S3_BUCKET: z.string().min(1),
+  S3_ACCESS_KEY_ID: z.string().min(1),
+  S3_SECRET_ACCESS_KEY: z.string().min(1),
+  S3_PUBLIC_BASE_URL: z.url(),
+  MAIMAID_STATIC_URL: z.url().default("https://maimaid-assets.rhythmeta.org"),
+  CHUNITHMD_STATIC_URL: z
+    .url()
+    .default("https://chunithmd-assets.rhythmeta.org"),
 });
-
-export type Env = z.infer<typeof EnvSchema>;
-
-export const parseEnv = (input: unknown): Env => EnvSchema.parse(input);
+export type Env = z.infer<typeof schema>;
+export const parseEnv = (input: unknown): Env => schema.parse(input);

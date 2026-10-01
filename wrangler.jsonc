@@ -1,23 +1,66 @@
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "maimaid-backend",
-	"main": ".worker/index.ts",
-	"compatibility_date": "2026-08-17",
-	"compatibility_flags": ["nodejs_compat"],
-	"workers_dev": true,
-	"preview_urls": false,
-	"upload_source_maps": true,
-	"routes": [],
-	"placement": {
-		"mode": "smart",
-	},
-	"observability": {
-		"enabled": true,
-	},
-	"hyperdrive": [
-		{
-			"binding": "HYPERDRIVE",
-			"id": "33c968fb6dfd4218bed8c2e8eddeb959",
-		},
-	],
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "alias": {
+    "@serenity-kit/opaque": "./.worker-vendor/opaque.js",
+  },
+  "name": "rhythmeta-backend",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "api.rhythmeta.org/*",
+      "zone_id": "3842c59d03b6d2d937b84f679b3bdb8b",
+    },
+  ],
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false,
+    },
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "rhythmeta",
+      "database_id": "8cf164dd-0277-4860-ba58-595ed35df784",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BACKUP_BUCKET",
+      "bucket_name": "maimaid-assets",
+    },
+  ],
+  "triggers": {
+    "crons": ["* * * * *"],
+  },
+  "account_id": "10dabe832f43634059930effbc08f01e",
+  "env": {
+    "staging": {
+      "name": "rhythmeta-backend-staging",
+      "routes": [],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "rhythmeta-staging",
+          "database_id": "658822d2-82b5-4039-ac9b-8967dad3495d",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "BACKUP_BUCKET",
+          "bucket_name": "maimaid-assets",
+        },
+      ],
+      "triggers": {
+        "crons": ["* * * * *"],
+      },
+    },
+  },
 }

@@ -1,140 +1,79 @@
 import { inject, injectable } from "tsyringe";
-import type { PrismaClient } from "@prisma/client";
 import { TOKENS } from "../di/tokens.js";
+import { Database, nowISO, type User } from "../db/database.js";
+import { AuthService } from "./auth.service.js";
+import {
+  buildUsernameBaseFromEmail,
+  serializeUserIdentity,
+} from "../lib/user-handle.js";
 import { AppError } from "../lib/errors.js";
-import { assignUserHandle, buildUsernameBaseFromEmail, serializeUserIdentity } from "../lib/user-handle.js";
-import { createOpaqueRegistrationResponse, hashPasswordFingerprint, normalizeOpaqueEnvelope } from "../lib/opaque-password.js";
-import type { Env } from "../env.js";
-
 @injectable()
 export class AdminUserService {
-	constructor(
-		@inject(TOKENS.Prisma) private readonly prisma: PrismaClient,
-		@inject(TOKENS.Env) private readonly env: Env,
-	) {}
-
-	async listUsers(input: { limit: number; offset: number }) {
-		const rows = await this.prisma.user.findMany({
-			orderBy: { createdAt: "desc" },
-			skip: input.offset,
-			take: input.limit,
-			include: {
-				totpCredential: true,
-				passkeyCredentials: {
-					select: { id: true },
-				},
-				_count: {
-					select: {
-						profiles: true,
-					},
-				},
-			},
-		});
-
-		const total = await this.prisma.user.count();
-		return {
-			total,
-			rows: rows.map((row) => ({
-				id: row.id,
-				email: row.email,
-				username: row.username,
-				usernameDiscriminator: row.usernameDiscriminator,
-				handle: `${row.username}#${row.usernameDiscriminator}`,
-				status: row.status,
-				isAdmin: row.isAdmin,
-				emailVerifiedAt: row.emailVerifiedAt,
-				createdAt: row.createdAt,
-				updatedAt: row.updatedAt,
-				profileCount: row._count.profiles,
-				mfa: {
-					totpEnabled: Boolean(row.totpCredential?.enabledAt),
-					passkeyCount: row.passkeyCredentials.length,
-					enabled: Boolean(row.totpCredential?.enabledAt) || row.passkeyCredentials.length > 0,
-				},
-			})),
-		};
-	}
-
-	async startOpaqueCreateUser(input: { email: string; registrationRequest: string }) {
-		const normalizedEmail = input.email.trim().toLowerCase();
-		if (!normalizedEmail || !normalizedEmail.includes("@")) {
-			throw new AppError(400, "invalid_email", "A valid email is required.");
-		}
-
-		const existed = await this.prisma.user.findUnique({
-			where: { email: normalizedEmail },
-		});
-		if (existed) {
-			throw new AppError(409, "email_exists", "Email already exists.");
-		}
-
-		return {
-			registrationResponse: await createOpaqueRegistrationResponse({
-				serverSetup: this.env.OPAQUE_SERVER_SETUP,
-				userIdentifier: normalizedEmail,
-				registrationRequest: input.registrationRequest,
-			}),
-		};
-	}
-
-	async finishOpaqueCreateUser(input: { email: string; registrationRecord: string; passwordFingerprint: string }) {
-		const normalizedEmail = input.email.trim().toLowerCase();
-		if (!normalizedEmail || !normalizedEmail.includes("@")) {
-			throw new AppError(400, "invalid_email", "A valid email is required.");
-		}
-
-		const existed = await this.prisma.user.findUnique({
-			where: { email: normalizedEmail },
-		});
-		if (existed) {
-			throw new AppError(409, "email_exists", "Email already exists.");
-		}
-
-		const passwordFingerprintHash = await hashPasswordFingerprint(input.passwordFingerprint);
-		const opaqueRegistrationRecord = normalizeOpaqueEnvelope(input.registrationRecord);
-		const user = await this.prisma.$transaction(async (tx) => {
-			const assignedHandle = await assignUserHandle(tx, {
-				requestedUsername: buildUsernameBaseFromEmail(normalizedEmail),
-			});
-			const created = await tx.user.create({
-				data: {
-					email: normalizedEmail,
-					passwordHash: null,
-					opaqueRegistrationRecord,
-					passwordFingerprintHash,
-					isAdmin: false,
-					...assignedHandle,
-				},
-			});
-			await tx.profile.create({
-				data: {
-					userId: created.id,
-					name: "Default",
-					server: "jp",
-					isActive: true,
-				},
-			});
-			return created;
-		});
-
-		return {
-			...serializeUserIdentity(user),
-			createdAt: user.createdAt,
-		};
-	}
-
-	async deleteUser(userId: string) {
-		const existed = await this.prisma.user.findUnique({
-			where: { id: userId },
-		});
-		if (!existed) {
-			throw new AppError(404, "user_not_found", "User not found.");
-		}
-		await this.prisma.user.delete({
-			where: { id: userId },
-		});
-		return {
-			deleted: true,
-		};
-	}
+  constructor(
+    @inject(TOKENS.Database) private readonly db: Database,
+    @inject(AuthService) private readonly auth: AuthService,
+  ) {}
+  async listUsers(input: { limit: number; offset: number }) {
+    const rows = await this.db.all<
+      User & { totpEnabled: number; passkeyCount: number }
+    >(
+      `SELECT u.*,
+   EXISTS(SELECT 1 FROM user_totp_credentials WHERE userId=u.id AND enabledAt IS NOT NULL) AS totpEnabled,
+   (SELECT COUNT(*) FROM user_passkey_credentials WHERE userId=u.id) AS passkeyCount FROM users u ORDER BY createdAt DESC LIMIT ? OFFSET ?`,
+      input.limit,
+      input.offset,
+    );
+    const total = (await this.db.get<{ total: number }>(
+      "SELECT COUNT(*) AS total FROM users",
+    ))!.total;
+    return {
+      total,
+      rows: rows.map((row) => ({
+        ...serializeUserIdentity({ ...row, isAdmin: Boolean(row.isAdmin) }),
+        status: row.status,
+        emailVerifiedAt: row.emailVerifiedAt,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        mfa: {
+          totpEnabled: Boolean(row.totpEnabled),
+          passkeyCount: row.passkeyCount,
+          enabled: Boolean(row.totpEnabled || row.passkeyCount),
+        },
+      })),
+    };
+  }
+  startOpaqueCreateUser(input: { email: string; registrationRequest: string }) {
+    return this.auth.startOpaqueRegistration(
+      input.email,
+      input.registrationRequest,
+    );
+  }
+  async finishOpaqueCreateUser(input: {
+    email: string;
+    registrationRecord: string;
+    passwordFingerprint: string;
+  }) {
+    const { user } = await this.auth.finishOpaqueRegistration(
+      input.email,
+      buildUsernameBaseFromEmail(input.email),
+      input.registrationRecord,
+      input.passwordFingerprint,
+    );
+    return { ...serializeUserIdentity(user), createdAt: user.createdAt };
+  }
+  async deleteUser(userId: string) {
+    // Preserve attribution on community records. Disabled identities cannot authenticate.
+    const result = await this.db.run(
+      "UPDATE users SET status='disabled',authVersion=authVersion+1,updatedAt=? WHERE id=?",
+      nowISO(),
+      userId,
+    );
+    if (!result.meta.changes)
+      throw new AppError(404, "user_not_found", "User not found.");
+    await this.db.run(
+      "UPDATE backups SET state='deleting' WHERE userId=?",
+      userId,
+    );
+    return { deleted: true };
+  }
 }

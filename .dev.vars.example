@@ -1,0 +1,13 @@
+# Development values only; use wrangler secret bulk for deployment.
+JWT_ACCESS_SECRET=replace-with-at-least-32-random-characters
+OPAQUE_SERVER_SETUP=generate-a-development-setup
+S3_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+S3_REGION=auto
+S3_BUCKET=maimaid-assets
+S3_ACCESS_KEY_ID=development-only
+S3_SECRET_ACCESS_KEY=development-only
+S3_PUBLIC_BASE_URL=https://assets.rhythmeta.org
+APP_PUBLIC_URL=http://localhost:3000
+CORS_ALLOWED_ORIGINS=http://localhost:3000
+WEBAUTHN_RP_ID=localhost
+WEBAUTHN_ORIGIN=http://localhost:3000

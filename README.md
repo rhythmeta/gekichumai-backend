@@ -1,180 +1,47 @@
-# maimaid backend (Hono + Prisma + DI)
+# Rhythmeta backend
 
-Self-hosted unified serverless-style backend for:
+Shared Rhythmeta accounts, game-scoped community aliases and manual cloud backups for maimaid and chunithmd. Runs on Cloudflare Workers, D1 and the existing public R2 bucket.
 
-- maimaid app canonical API (`/v1/*`)
-- user-initiated import from Diving Fish / LXNS into canonical data model
+- `/auth/v1`: OPAQUE/legacy bcrypt login, email verification/reset, MFA/passkeys, refresh tokens and PKCE app handoff.
+- `/{maimaid,chunithmd}/v1/community`: aliases, voting and moderation.
+- `/{maimaid,chunithmd}/v1/backups`: signed uploads, checksum-verified commit, latest three snapshots and deletion.
+- `/health`, `/docs`, `/openapi.json`: service health and API documentation.
+- Legacy `/v1/*` returns HTTP 410. Profiles, scores, imports, collections and multiplayer no longer live in the backend.
 
-## Stack
+## Development
 
-- Runtime: Bun (Docker runtime) + Node.js (local dev scripts)
-- Framework: Hono
-- DI: tsyringe
-- ORM: Prisma
-- DB: PostgreSQL (`pg_cron` extension enabled in migration)
-- Storage: S3-compatible object storage (pre-signed upload URL)
-
-## Quick start
-
-1. Copy env file:
-
-```bash
-cp backend/.env.docker.example backend/.env.docker
+```sh
+pnpm install --frozen-lockfile
+cp .dev.vars.example .dev.vars
+pnpm db:migrate
+pnpm dev
+pnpm test
+pnpm build
 ```
 
-Optional for secrets and machine-local overrides:
+Generate a development OPAQUE setup with `@serenity-kit/opaque`; never regenerate the production setup. `prepare:worker` extracts the package's WASM to a static Worker module because Workers cannot compile arbitrary WASM at runtime.
 
-```bash
-cp backend/.env.docker backend/.env.docker.local
+## Deploy
+
+The Worker requires a D1 `DB` binding and an R2 `BACKUP_BUCKET` binding. Public settings and binding IDs are in `wrangler.jsonc`. Set the secrets listed in `.dev.vars.example` with `wrangler secret bulk`. Keep the existing OPAQUE setup and `WEBAUTHN_RP_ID=rhythmeta.org`. The dashboard origin is `https://dash.rhythmeta.org`.
+
+The repository workflow validates every pull request. Production deployment is manually dispatched and requires `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` repository or organization secrets. R2 S3 credentials remain Worker secrets; a narrowly scoped token needs Workers deployment, D1 and R2 access.
+
+The minute cron settles closed alias votes and removes deleted/expired snapshots. Upload staging objects use `backup-uploads/`; configure a one-day R2 lifecycle expiry on that prefix, including objects re-uploaded through a still-valid five-minute upload URL. Final objects use `backups/{game}/{random UUID}.pb.gz`. Never cache either prefix at the public domain. All object responses carry `Cache-Control: no-store`.
+
+Public download URLs are bearer links, as selected for this project. They must not appear in invocation logs, analytics or referrers. Authenticated routes control listing, upload, commit and deletion. A staging object and its committed object have different keys, so a reusable upload URL cannot overwrite a committed snapshot.
+
+## PostgreSQL migration
+
+```sh
+python3 scripts/import-postgres-backup.py /private/maimaid.dump \
+  --env-file /private/.env.docker --output .migration/run-001
 ```
 
-2. Install dependencies:
+The script fully reads the archive, selects only accounts/authentication credentials and community data, normalizes PostgreSQL representations, and rehearses all inserts in SQLite with integrity/foreign-key checks. The output contains credentials and is private/ignored. Never commit or upload it as a CI artifact.
 
-```bash
-pnpm install
-```
+Apply `migrations/0001_rhythmeta.sql` to an empty D1 database, then import the generated `data.sql`. Compare `report.json` counts before assigning production routes. Old sessions are intentionally invalidated. Keep the PostgreSQL archive and the old service available for rollback until the cutover is accepted.
 
-3. Generate Prisma client:
+## Snapshot contract
 
-```bash
-pnpm --filter backend prisma:generate
-```
-
-4. Run migrations:
-
-```bash
-pnpm run migrate:server
-```
-
-5. Start server:
-
-```bash
-pnpm run dev:server
-```
-
-## Local test stack (Podman Compose)
-
-This repo now includes a ready-to-run local stack:
-
-- PostgreSQL 18.3 + `pg_cron`
-- MinIO (S3-compatible storage)
-- backend API service (Bun 1.3.2 runtime)
-
-1. Prepare local env:
-
-```bash
-cp backend/.env.docker.example backend/.env.docker
-```
-
-Optional (recommended for local secrets): create `backend/.env.docker.local` for overrides such as `RESEND_API_KEY` or `OPAQUE_SERVER_SETUP`.
-If you change MinIO credentials, update both `MINIO_ROOT_*` and `S3_ACCESS_*` to the same values.
-
-2. Start stack:
-
-```bash
-cd backend
-pnpm run podman:up
-```
-
-3. Verify:
-
-- API: `http://localhost:8787/health`
-- OpenAPI JSON: `http://localhost:8787/openapi.json`
-- API docs (Scalar): `http://localhost:8787/docs`
-- MinIO API: `http://localhost:9000`
-- MinIO Console: `http://localhost:9001`
-- Postgres host port: `localhost:54329`
-
-4. Point iOS to local backend:
-
-- Set `BACKEND_URL = http://localhost:8787` in `ios/Config/Secrets.xcconfig`
-
-5. Stop stack:
-
-```bash
-cd backend
-pnpm run podman:down
-```
-
-## Monorepo scripts
-
-At repository root:
-
-- `pnpm run dev:server` – start backend in watch mode
-- `pnpm run build:server` – compile backend
-- `pnpm run test:server` – run backend tests
-- `pnpm run migrate:server` – deploy Prisma migrations
-
-## Environment variables
-
-The backend reads `backend/.env.docker` first, then overlays `backend/.env.docker.local`.
-Values already present in the process environment still win over both files.
-
-See `backend/.env.docker.example`:
-
-- Network: `HOST`, `PORT`
-- Public URL: `APP_PUBLIC_URL` (used to build email verification links)
-- CORS: `CORS_ALLOWED_ORIGINS` (comma-separated exact web origins)
-- WebAuthn: `WEBAUTHN_ORIGIN`, `WEBAUTHN_RP_ID` (local dashboard with Next.js defaults to `http://localhost:3000`)
-- Auth: `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_ACCESS_SECRET`, `JWT_ACCESS_TTL_SECONDS`, `JWT_REFRESH_TTL_SECONDS`
-- OPAQUE: `OPAQUE_SERVER_SETUP` (stable secret; do not rotate casually or existing OPAQUE password records will stop working)
-- Database: `DATABASE_URL`
-- Catalog source override: `CATALOG_SOURCE_URL` (optional; used only for manual `/v1/catalog/sync` flow)
-- MinIO root credentials (local compose): `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`
-- S3: `S3_*`
-  - For Podman local testing, keep `S3_ENDPOINT=http://minio:9000` and set `S3_PUBLIC_ENDPOINT=http://localhost:9000` so pre-signed upload URLs are reachable from iOS/macOS host.
-  - In local compose, keep `S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY` aligned with `MINIO_ROOT_USER/MINIO_ROOT_PASSWORD`.
-  - Keep `S3_BUCKET` private for profile avatars.
-- Static data: the Actions builder fetches source configuration from the API,
-  generates `static-worker/public`, deploys Cloudflare Worker Static Assets, and
-  calls `POST /internal/jobs/static-bundle/generated` to record the publication
-  and apply its catalog to backend business tables.
-
-## API surfaces
-
-- Canonical:
-  - `GET /health`
-  - `POST /v1/auth/*`
-  - `GET /v1/auth/verify-email?token=...`
-  - `GET /v1/auth/password-reset?token=...`
-  - `GET/POST/PUT/PATCH /v1/profiles/*`
-  - `GET/POST /v1/catalog/*`
-  - `GET/PATCH/DELETE /v1/scores/*`
-  - `POST /v1/scores:batchUpsert`
-  - `POST /v1/scores:replace`
-  - `GET/DELETE /v1/play-records/*`
-  - `POST /v1/play-records:batchUpsert`
-  - `POST /v1/play-records:replace`
-  - `POST /v1/imports:*`
-  - `GET/POST /v1/community/*`
-  - `GET/POST/PATCH /v1/admin/*`
-- Internal jobs:
-  - `POST /internal/jobs/enqueue`
-  - `POST /internal/jobs/dispatch`
-
-## Data model highlights
-
-Prisma schema includes:
-
-- Catalog: `catalog_snapshots`, `songs`, `sheets`, `aliases`, `icons`
-- User/profile: `users`, `profiles`, `profile_bindings`
-- Score: `best_scores`, `play_records`
-- Import: `import_runs`, `import_raw_payloads`
-- Community aliases: `community_alias_candidates`, `community_alias_votes`
-- Ops jobs: `job_queue`
-
-## Cron & sync
-
-Migration enables `pg_cron` and registers:
-
-- periodic catalog sync job enqueue
-- periodic community alias cycle roll job enqueue
-
-Actual execution is handled by `/internal/jobs/dispatch` (or your own worker trigger).
-
-## Tests
-
-Current tests cover:
-
-- LXNS song ID normalization rule (`>10000` modulo, `>100000` passthrough)
-- Chart type / difficulty normalization utilities used by import pipeline
+`protocol/backup.proto` is the portable wire contract. Clients gzip the protobuf, authenticate requests for signed upload URLs, and supply SHA-256 plus compressed/uncompressed sizes. Limits are 64 MiB compressed and 512 MiB uncompressed. Clients validate format/game/references, retain a durable local rollback, and replace personal data as one user operation. Static catalog assets and credentials are excluded.

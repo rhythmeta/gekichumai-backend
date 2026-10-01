@@ -1,0 +1,52 @@
+name: Deploy backend
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: production-backend
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test && pnpm build
+      - name: Install Worker secrets
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          JWT_ACCESS_SECRET: ${{ secrets.JWT_ACCESS_SECRET }}
+          OPAQUE_SERVER_SETUP: ${{ secrets.OPAQUE_SERVER_SETUP }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          S3_PUBLIC_BASE_URL: ${{ secrets.S3_PUBLIC_BASE_URL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+          APP_PUBLIC_URL: ${{ secrets.APP_PUBLIC_URL }}
+          CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS }}
+          WEBAUTHN_RP_ID: ${{ secrets.WEBAUTHN_RP_ID }}
+          WEBAUTHN_ORIGIN: ${{ secrets.WEBAUTHN_ORIGIN }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, pathlib
+          keys = ['JWT_ACCESS_SECRET', 'OPAQUE_SERVER_SETUP', 'S3_ENDPOINT', 'S3_REGION', 'S3_BUCKET', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_PUBLIC_BASE_URL', 'RESEND_API_KEY', 'RESEND_FROM_EMAIL', 'APP_PUBLIC_URL', 'CORS_ALLOWED_ORIGINS', 'WEBAUTHN_RP_ID', 'WEBAUTHN_ORIGIN']
+          destination = pathlib.Path(os.environ["RUNNER_TEMP"]) / "worker-secrets.json"
+          destination.write_text(json.dumps({key: os.environ[key] for key in keys if os.environ.get(key)}))
+          destination.chmod(0o600)
+          PYTHON
+          pnpm exec wrangler secret bulk "$RUNNER_TEMP/worker-secrets.json"
+          rm "$RUNNER_TEMP/worker-secrets.json"
+      - run: pnpm db:migrate:remote && pnpm deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

@@ -1,587 +1,416 @@
-import { Prisma, type PrismaClient } from "@prisma/client";
 import { inject, injectable } from "tsyringe";
 import { TOKENS } from "../di/tokens.js";
+import { Database, nowISO, type Game, type SqlValue } from "../db/database.js";
 import { AppError } from "../lib/errors.js";
-import { CatalogService } from "./catalog.service.js";
-import { buildHandle } from "../lib/user-handle.js";
+import type { Env } from "../env.js";
 
-const SHANGHAI_TIMEZONE = "Asia/Shanghai";
-type DuplicateReason = "lxns_existing" | "community_existing" | "admin_rejected_locked";
+type Candidate = {
+  id: string;
+  game: Game;
+  songIdentifier: string;
+  aliasText: string;
+  aliasNorm: string;
+  submitterId: string;
+  status: "voting" | "approved" | "rejected";
+  rejectionSource: string | null;
+  voteCloseAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+const indexCache = new Map<
+  string,
+  { until: number; songs: Record<string, string[]> }
+>();
+export const normalizeAlias = (value: string) =>
+  value
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s]+/gu, "")
+    .replace(
+      /[\p{P}\p{S}，。！？、；：·・•（）【】《》〈〉「」『』“”‘’—～＿－…￥]+/gu,
+      "",
+    );
+const today = () =>
+  new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10);
+const detailSelect = `SELECT c.*,c.id AS candidateId,u.username||'#'||u.usernameDiscriminator AS submitterHandle,
+ (SELECT COUNT(*) FROM community_alias_votes WHERE candidateId=c.id AND vote=1) AS supportCount,
+ (SELECT COUNT(*) FROM community_alias_votes WHERE candidateId=c.id AND vote=-1) AS opposeCount
+ FROM community_alias_candidates c JOIN users u ON u.id=c.submitterId`;
 
 @injectable()
 export class CommunityAliasService {
-	constructor(
-		@inject(TOKENS.Prisma) private readonly prisma: PrismaClient,
-		@inject(CatalogService) private readonly catalogService: CatalogService,
-	) {}
-
-	normalizeAlias(raw: string): string {
-		return raw
-			.normalize("NFKC")
-			.trim()
-			.toLowerCase()
-			.replace(/[\s]+/gu, "")
-			.replace(/[\p{P}\p{S}，。！？、；：·・•（）【】《》〈〉「」『』“”‘’—～＿－…￥]+/gu, "");
-	}
-
-	async submitAlias(input: {
-		userId: string;
-		isAdmin: boolean;
-		songIdentifier: string;
-		aliasText: string;
-		deviceLocalDate: string;
-		tzOffsetMinutes: number;
-	}) {
-		const aliasText = input.aliasText.trim();
-		const aliasNorm = this.normalizeAlias(aliasText);
-		if (!input.songIdentifier || !aliasText || aliasText.length > 64 || !aliasNorm) {
-			throw new AppError(400, "invalid_request", "songIdentifier and aliasText are required.");
-		}
-
-		const [dailyCount, lxnsAliases, communityCandidate, communityAlias, adminRejectedCandidate] = await Promise.all([
-			this.prisma.communityAliasCandidate.count({
-				where: {
-					submitterId: input.userId,
-					submittedLocalDate: new Date(input.deviceLocalDate),
-				},
-			}),
-			this.catalogService.listAliases(input.songIdentifier, "lxns"),
-			this.prisma.communityAliasCandidate.findFirst({
-				where: {
-					songIdentifier: input.songIdentifier,
-					aliasNorm,
-					status: { in: ["voting", "approved"] },
-				},
-			}),
-			this.prisma.alias.findFirst({
-				where: {
-					songIdentifier: input.songIdentifier,
-					aliasNorm,
-					source: "community",
-				},
-			}),
-			this.prisma.communityAliasCandidate.findFirst({
-				where: {
-					songIdentifier: input.songIdentifier,
-					aliasNorm,
-					status: "rejected",
-					rejectionSource: "admin_manual",
-				},
-			}),
-		]);
-
-		const lxnsMatched = lxnsAliases.find(
-			(item) => this.normalizeAlias(item.aliasText) === aliasNorm || this.normalizeAlias(item.aliasNorm) === aliasNorm,
-		);
-		if (lxnsMatched) {
-			return this.buildDuplicateResponse({
-				message: "该别名已在 LXNS 中存在，无法重复投稿。",
-				duplicateReason: "lxns_existing",
-				similarAliases: [lxnsMatched.aliasText],
-			});
-		}
-
-		if (communityCandidate || communityAlias) {
-			return this.buildDuplicateResponse({
-				message: "该别名已在社区别名中存在，无法重复投稿。",
-				duplicateReason: "community_existing",
-				similarAliases: [communityCandidate?.aliasText, communityAlias?.aliasText].filter((value): value is string =>
-					Boolean(value),
-				),
-			});
-		}
-
-		if (adminRejectedCandidate && !input.isAdmin) {
-			return this.buildDuplicateResponse({
-				message: "该别名曾被管理员拒绝，仅管理员可再次投稿。",
-				duplicateReason: "admin_rejected_locked",
-				similarAliases: [adminRejectedCandidate.aliasText],
-			});
-		}
-
-		if (dailyCount >= 5) {
-			return {
-				status: "quota_exceeded",
-				message: "Daily alias submission quota reached.",
-				quotaRemaining: 0,
-			} as const;
-		}
-
-		const voteOpenAt = new Date();
-		const voteCloseAt = this.computeVoteCloseAt(voteOpenAt);
-
-		const candidate = await this.prisma.communityAliasCandidate.create({
-			data: {
-				songIdentifier: input.songIdentifier,
-				aliasText,
-				aliasNorm,
-				submitterId: input.userId,
-				status: "voting",
-				rejectionSource: null,
-				voteOpenAt,
-				voteCloseAt,
-				submittedLocalDate: new Date(input.deviceLocalDate),
-				submittedTzOffsetMin: Math.trunc(input.tzOffsetMinutes),
-			},
-		});
-
-		return {
-			status: "created",
-			message: "Alias submitted and is now public for the next 72 hours.",
-			candidate,
-			quotaRemaining: Math.max(0, 5 - (dailyCount + 1)),
-		} as const;
-	}
-
-	async fetchVotingBoard(userId: string | null, limit: number, offset: number) {
-		const safeLimit = Math.max(1, Math.min(limit, 200));
-		const safeOffset = Math.max(0, offset);
-
-		const rows = await this.prisma.communityAliasCandidate.findMany({
-			where: {
-				status: "voting",
-				OR: [{ voteOpenAt: null }, { voteOpenAt: { lte: new Date() } }],
-				AND: [{ OR: [{ voteCloseAt: null }, { voteCloseAt: { gte: new Date() } }] }],
-			},
-			include: {
-				submitter: {
-					select: {
-						username: true,
-						usernameDiscriminator: true,
-					},
-				},
-				votes: true,
-			},
-			orderBy: [{ voteCloseAt: "asc" }, { createdAt: "desc" }],
-			skip: safeOffset,
-			take: safeLimit,
-		});
-
-		return rows.map((row) => {
-			const supportCount = row.votes.filter((item) => item.vote === 1).length;
-			const opposeCount = row.votes.filter((item) => item.vote === -1).length;
-			const myVote = userId ? (row.votes.find((item) => item.voterId === userId)?.vote ?? null) : null;
-			return {
-				candidateId: row.id,
-				songIdentifier: row.songIdentifier,
-				aliasText: row.aliasText,
-				submitterId: row.submitterId,
-				submitterHandle: buildHandle(row.submitter.username, row.submitter.usernameDiscriminator),
-				voteOpenAt: row.voteOpenAt,
-				voteCloseAt: row.voteCloseAt,
-				supportCount,
-				opposeCount,
-				myVote,
-				createdAt: row.createdAt,
-			};
-		});
-	}
-
-	async fetchMyCandidates(userId: string, limit: number, songIdentifier?: string) {
-		const where: Prisma.CommunityAliasCandidateWhereInput = {
-			submitterId: userId,
-		};
-		if (songIdentifier !== undefined) {
-			where.songIdentifier = songIdentifier;
-		}
-
-		const rows = await this.prisma.communityAliasCandidate.findMany({
-			where,
-			include: {
-				votes: true,
-			},
-			orderBy: { createdAt: "desc" },
-			take: Math.max(1, Math.min(limit, 200)),
-		});
-
-		return rows.map((row) => ({
-			candidateId: row.id,
-			songIdentifier: row.songIdentifier,
-			aliasText: row.aliasText,
-			status: row.status,
-			voteOpenAt: row.voteOpenAt,
-			voteCloseAt: row.voteCloseAt,
-			supportCount: row.votes.filter((item) => item.vote === 1).length,
-			opposeCount: row.votes.filter((item) => item.vote === -1).length,
-			createdAt: row.createdAt,
-			updatedAt: row.updatedAt,
-		}));
-	}
-
-	async fetchMyDailyCount(userId: string, localDate: string) {
-		const date = new Date(localDate);
-		if (Number.isNaN(date.getTime())) {
-			throw new AppError(400, "invalid_date", "Invalid local date.");
-		}
-		return this.prisma.communityAliasCandidate.count({
-			where: {
-				submitterId: userId,
-				submittedLocalDate: date,
-			},
-		});
-	}
-
-	async vote(userId: string, candidateId: string, vote: number) {
-		if (vote !== -1 && vote !== 1) {
-			throw new AppError(400, "invalid_vote", "Invalid vote value.");
-		}
-
-		const candidate = await this.prisma.communityAliasCandidate.findUnique({
-			where: { id: candidateId },
-		});
-		if (!candidate) {
-			throw new AppError(404, "candidate_not_found", "Candidate not found.");
-		}
-		if (candidate.status !== "voting") {
-			throw new AppError(400, "candidate_not_voting", "Candidate is not in voting status.");
-		}
-		const now = new Date();
-		if ((candidate.voteOpenAt && now < candidate.voteOpenAt) || (candidate.voteCloseAt && now > candidate.voteCloseAt)) {
-			throw new AppError(400, "voting_window_closed", "Voting window is closed.");
-		}
-
-		const existingVote = await this.prisma.communityAliasVote.findUnique({
-			where: {
-				candidateId_voterId: {
-					candidateId,
-					voterId: userId,
-				},
-			},
-		});
-
-		let myVote: number | null = vote;
-		if (existingVote && existingVote.vote === vote) {
-			await this.prisma.communityAliasVote.delete({
-				where: {
-					candidateId_voterId: {
-						candidateId,
-						voterId: userId,
-					},
-				},
-			});
-			myVote = null;
-		} else {
-			await this.prisma.communityAliasVote.upsert({
-				where: {
-					candidateId_voterId: {
-						candidateId,
-						voterId: userId,
-					},
-				},
-				create: {
-					candidateId,
-					voterId: userId,
-					vote,
-				},
-				update: {
-					vote,
-				},
-			});
-		}
-
-		const votes = await this.prisma.communityAliasVote.findMany({
-			where: { candidateId },
-		});
-		return {
-			candidateId,
-			supportCount: votes.filter((item) => item.vote === 1).length,
-			opposeCount: votes.filter((item) => item.vote === -1).length,
-			myVote,
-		};
-	}
-
-	async approvedSync(since: Date | null, limit: number) {
-		const where: Prisma.CommunityAliasCandidateWhereInput = {
-			status: "approved",
-		};
-		if (since) {
-			where.updatedAt = { gt: since };
-		}
-
-		const rows = await this.prisma.communityAliasCandidate.findMany({
-			where,
-			orderBy: { updatedAt: "asc" },
-			take: Math.max(1, Math.min(limit, 2000)),
-		});
-
-		return rows.map((row) => ({
-			candidateId: row.id,
-			songIdentifier: row.songIdentifier,
-			aliasText: row.aliasText,
-			updatedAt: row.updatedAt,
-			approvedAt: row.approvedAt,
-		}));
-	}
-
-	async rollCycle() {
-		const now = new Date();
-		const due = await this.prisma.communityAliasCandidate.findMany({
-			where: {
-				status: "voting",
-				voteCloseAt: {
-					lte: now,
-				},
-			},
-			include: {
-				votes: true,
-			},
-		});
-
-		let settledCount = 0;
-
-		for (const candidate of due) {
-			const support = candidate.votes.filter((item) => item.vote === 1).length;
-			const oppose = candidate.votes.filter((item) => item.vote === -1).length;
-			const approved = support > oppose && support >= 3;
-			if (!approved) {
-				await this.deleteOtherRejectedCandidates(candidate.songIdentifier, candidate.aliasNorm, candidate.id);
-			}
-			await this.prisma.communityAliasCandidate.update({
-				where: { id: candidate.id },
-				data: {
-					status: approved ? "approved" : "rejected",
-					rejectionSource: approved ? null : "community_vote",
-					approvedAt: approved ? now : null,
-					rejectedAt: approved ? null : now,
-				},
-			});
-
-			if (approved) {
-				await this.prisma.alias.upsert({
-					where: {
-						songIdentifier_aliasNorm_source: {
-							songIdentifier: candidate.songIdentifier,
-							aliasNorm: candidate.aliasNorm,
-							source: "community",
-						},
-					},
-					create: {
-						songIdentifier: candidate.songIdentifier,
-						aliasText: candidate.aliasText,
-						aliasNorm: candidate.aliasNorm,
-						source: "community",
-						status: "approved",
-					},
-					update: {
-						aliasText: candidate.aliasText,
-						status: "approved",
-					},
-				});
-			}
-
-			settledCount += 1;
-		}
-
-		return {
-			now,
-			timezone: SHANGHAI_TIMEZONE,
-			settledCount,
-		};
-	}
-
-	async adminDashboardStats() {
-		const now = new Date();
-		const startOfDayShanghai = new Date(new Date().toLocaleString("en-US", { timeZone: SHANGHAI_TIMEZONE, hour12: false }));
-		startOfDayShanghai.setHours(0, 0, 0, 0);
-		const endOfDayShanghai = new Date(startOfDayShanghai);
-		endOfDayShanghai.setDate(endOfDayShanghai.getDate() + 1);
-
-		const [totalCount, votingCount, approvedCount, rejectedCount, closingSoonCount, expiredVotingCount, todaySubmissions] =
-			await Promise.all([
-				this.prisma.communityAliasCandidate.count(),
-				this.prisma.communityAliasCandidate.count({ where: { status: "voting" } }),
-				this.prisma.communityAliasCandidate.count({ where: { status: "approved" } }),
-				this.prisma.communityAliasCandidate.count({ where: { status: "rejected" } }),
-				this.prisma.communityAliasCandidate.count({
-					where: {
-						status: "voting",
-						voteCloseAt: { gte: now, lte: new Date(now.getTime() + 24 * 60 * 60 * 1000) },
-					},
-				}),
-				this.prisma.communityAliasCandidate.count({
-					where: {
-						status: "voting",
-						voteCloseAt: { lt: now },
-					},
-				}),
-				this.prisma.communityAliasCandidate.count({
-					where: {
-						createdAt: {
-							gte: startOfDayShanghai,
-							lt: endOfDayShanghai,
-						},
-					},
-				}),
-			]);
-
-		return {
-			totalCount,
-			votingCount,
-			approvedCount,
-			rejectedCount,
-			closingSoonCount,
-			expiredVotingCount,
-			todaySubmissions,
-		};
-	}
-
-	async adminListCandidates(input: {
-		status?: string | null;
-		search?: string | null;
-		sort?: string | null;
-		limit: number;
-		offset: number;
-	}) {
-		const where: Prisma.CommunityAliasCandidateWhereInput = {};
-		if (input.status && input.status !== "all") {
-			where.status = input.status as Prisma.EnumCandidateStatusFilter<"CommunityAliasCandidate">;
-		}
-		if (input.search) {
-			const search = input.search.trim();
-			where.OR = [
-				{ songIdentifier: { contains: search, mode: "insensitive" } },
-				{ aliasText: { contains: search, mode: "insensitive" } },
-			];
-		}
-
-		const [rows, totalCount] = await Promise.all([
-			this.prisma.communityAliasCandidate.findMany({
-				where,
-				include: { votes: true, submitter: true },
-				orderBy: this.resolveAdminSort(input.sort),
-				skip: input.offset,
-				take: input.limit,
-			}),
-			this.prisma.communityAliasCandidate.count({ where }),
-		]);
-
-		return rows.map((row) => ({
-			candidateId: row.id,
-			songIdentifier: row.songIdentifier,
-			aliasText: row.aliasText,
-			submitterId: row.submitterId,
-			submitterEmail: row.submitter.email,
-			submitterHandle: buildHandle(row.submitter.username, row.submitter.usernameDiscriminator),
-			status: row.status,
-			voteOpenAt: row.voteOpenAt,
-			voteCloseAt: row.voteCloseAt,
-			approvedAt: row.approvedAt,
-			rejectedAt: row.rejectedAt,
-			supportCount: row.votes.filter((item) => item.vote === 1).length,
-			opposeCount: row.votes.filter((item) => item.vote === -1).length,
-			totalCount,
-			createdAt: row.createdAt,
-			updatedAt: row.updatedAt,
-		}));
-	}
-
-	async adminCreateCandidate(input: {
-		submitterId: string;
-		songIdentifier: string;
-		aliasText: string;
-		status: "voting" | "approved";
-	}) {
-		const aliasNorm = this.normalizeAlias(input.aliasText);
-		const now = new Date();
-		return this.prisma.communityAliasCandidate.create({
-			data: {
-				songIdentifier: input.songIdentifier,
-				aliasText: input.aliasText,
-				aliasNorm,
-				submitterId: input.submitterId,
-				status: input.status,
-				voteOpenAt: now,
-				voteCloseAt: input.status === "voting" ? this.computeVoteCloseAt(now) : now,
-				approvedAt: input.status === "approved" ? now : null,
-				submittedLocalDate: now,
-				submittedTzOffsetMin: 480,
-			},
-		});
-	}
-
-	async adminSetStatus(candidateId: string, status: "voting" | "approved" | "rejected") {
-		const candidate = await this.prisma.communityAliasCandidate.findUnique({
-			where: { id: candidateId },
-		});
-		if (!candidate) {
-			throw new AppError(404, "candidate_not_found", "Candidate not found.");
-		}
-
-		if (status === "rejected") {
-			await this.deleteOtherRejectedCandidates(candidate.songIdentifier, candidate.aliasNorm, candidateId);
-		}
-
-		const now = new Date();
-		const data: Prisma.CommunityAliasCandidateUpdateInput = {
-			status,
-			rejectionSource: status === "rejected" ? "admin_manual" : null,
-			approvedAt: status === "approved" ? now : null,
-			rejectedAt: status === "rejected" ? now : null,
-		};
-		if (status === "voting") {
-			data.voteOpenAt = now;
-			data.voteCloseAt = this.computeVoteCloseAt(now);
-		}
-
-		return this.prisma.communityAliasCandidate.update({
-			where: { id: candidateId },
-			data,
-		});
-	}
-
-	async adminUpdateVoteWindow(candidateId: string, voteCloseAt: Date) {
-		if (voteCloseAt <= new Date()) {
-			throw new AppError(400, "invalid_vote_close_at", "vote_close_at must be later than now.");
-		}
-		return this.prisma.communityAliasCandidate.update({
-			where: { id: candidateId },
-			data: {
-				voteOpenAt: new Date(),
-				voteCloseAt,
-			},
-		});
-	}
-
-	private resolveAdminSort(sort?: string | null): Prisma.CommunityAliasCandidateOrderByWithRelationInput[] {
-		switch ((sort ?? "updated_desc").toLowerCase()) {
-			case "deadline_asc":
-				return [{ voteCloseAt: "asc" }, { createdAt: "desc" }];
-			case "created_desc":
-				return [{ createdAt: "desc" }];
-			case "created_asc":
-				return [{ createdAt: "asc" }];
-			case "updated_asc":
-				return [{ updatedAt: "asc" }];
-			default:
-				return [{ updatedAt: "desc" }, { createdAt: "desc" }];
-		}
-	}
-
-	private computeVoteCloseAt(from: Date): Date {
-		return new Date(from.getTime() + 72 * 60 * 60 * 1000);
-	}
-
-	private buildDuplicateResponse(input: { message: string; duplicateReason: DuplicateReason; similarAliases?: string[] }) {
-		const similarAliases = Array.from(new Set((input.similarAliases ?? []).map((value) => value.trim()).filter(Boolean)));
-		return {
-			status: "rejected_duplicate",
-			message: input.message,
-			duplicateReason: input.duplicateReason,
-			similarAliases: similarAliases.length > 0 ? similarAliases.slice(0, 3) : undefined,
-			candidate: null,
-		} as const;
-	}
-
-	private async deleteOtherRejectedCandidates(songIdentifier: string, aliasNorm: string, candidateId: string) {
-		await this.prisma.communityAliasCandidate.deleteMany({
-			where: {
-				songIdentifier,
-				aliasNorm,
-				status: "rejected",
-				id: {
-					not: candidateId,
-				},
-			},
-		});
-	}
+  constructor(
+    @inject(TOKENS.Database) private readonly db: Database,
+    @inject(TOKENS.Env) private readonly env: Env,
+    readonly game: Game = "maimaid",
+  ) {}
+  normalizeAlias = normalizeAlias;
+  private async catalogAliases(songIdentifier: string) {
+    const base =
+      this.game === "maimaid"
+        ? this.env.MAIMAID_STATIC_URL
+        : this.env.CHUNITHMD_STATIC_URL;
+    let cached = indexCache.get(base);
+    if (!cached || cached.until < Date.now()) {
+      const response = await fetch(`${base}/community-index.json`, {
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok)
+        throw new AppError(
+          503,
+          "catalog_unavailable",
+          "Song index is temporarily unavailable.",
+        );
+      const data = (await response.json()) as {
+        songs: Record<string, string[]>;
+      };
+      if (!data.songs || typeof data.songs !== "object")
+        throw new AppError(503, "catalog_unavailable", "Invalid song index.");
+      cached = { songs: data.songs, until: Date.now() + 300_000 };
+      indexCache.set(base, cached);
+    }
+    if (!Object.hasOwn(cached.songs, songIdentifier))
+      throw new AppError(404, "song_not_found", "Song does not exist.");
+    return cached.songs[songIdentifier];
+  }
+  async submitAlias(input: {
+    userId: string;
+    isAdmin: boolean;
+    songIdentifier: string;
+    aliasText: string;
+    deviceLocalDate?: string;
+    tzOffsetMinutes?: number;
+  }) {
+    const text = input.aliasText.trim(),
+      norm = normalizeAlias(text);
+    if (!norm || text.length > 64)
+      throw new AppError(400, "invalid_request", "Alias is invalid.");
+    const external = await this.catalogAliases(input.songIdentifier);
+    const match = external.find((value) => normalizeAlias(value) === norm);
+    if (match)
+      return {
+        status: "rejected_duplicate",
+        duplicateReason: "lxns_existing",
+        message: "Alias already exists.",
+        similarAliases: [match],
+        candidate: null,
+      };
+    const duplicate = await this.db.get<Candidate>(
+      `SELECT * FROM community_alias_candidates WHERE game=? AND songIdentifier=? AND aliasNorm=? AND (status IN ('voting','approved') OR rejectionSource='admin_manual') ORDER BY createdAt DESC LIMIT 1`,
+      this.game,
+      input.songIdentifier,
+      norm,
+    );
+    const alias = await this.db.get<{ aliasText: string }>(
+      "SELECT aliasText FROM aliases WHERE game=? AND songIdentifier=? AND aliasNorm=?",
+      this.game,
+      input.songIdentifier,
+      norm,
+    );
+    if (
+      alias ||
+      (duplicate &&
+        (duplicate.rejectionSource !== "admin_manual" || !input.isAdmin))
+    )
+      return {
+        status: "rejected_duplicate",
+        duplicateReason:
+          duplicate?.rejectionSource === "admin_manual"
+            ? "admin_rejected_locked"
+            : "community_existing",
+        message: "Alias already exists or was rejected by an administrator.",
+        similarAliases: [alias?.aliasText ?? duplicate!.aliasText],
+        candidate: null,
+      };
+    const id = crypto.randomUUID(),
+      now = nowISO();
+    const result = await this.db.run(
+      `INSERT INTO community_alias_candidates(id,game,songIdentifier,aliasText,aliasNorm,submitterId,status,voteOpenAt,voteCloseAt,submittedLocalDate,createdAt,updatedAt)
+   SELECT ?,?,?,?,?,?,'voting',?,?,?,?,? WHERE (SELECT COUNT(*) FROM community_alias_candidates WHERE game=? AND submitterId=? AND submittedLocalDate=?)<5`,
+      id,
+      this.game,
+      input.songIdentifier,
+      text,
+      norm,
+      input.userId,
+      now,
+      new Date(Date.now() + 72 * 3600_000).toISOString(),
+      today(),
+      now,
+      now,
+      this.game,
+      input.userId,
+      today(),
+    );
+    if (!result.meta.changes)
+      return {
+        status: "quota_exceeded",
+        message: "Daily submission quota reached.",
+        quotaRemaining: 0,
+      };
+    return {
+      status: "created",
+      message: "Alias submitted for 72 hours of voting.",
+      candidate: await this.candidate(id),
+      quotaRemaining: Math.max(
+        0,
+        5 - (await this.fetchMyDailyCount(input.userId)),
+      ),
+    };
+  }
+  private async candidate(id: string) {
+    const row = await this.db.get<Candidate>(
+      "SELECT * FROM community_alias_candidates WHERE id=? AND game=?",
+      id,
+      this.game,
+    );
+    if (!row)
+      throw new AppError(404, "candidate_not_found", "Candidate not found.");
+    return row;
+  }
+  async fetchVotingBoard(userId: string | null, limit: number, offset: number) {
+    const now = nowISO();
+    return this.db.all(
+      `${detailSelect.replace(" FROM community_alias_candidates c", `,(SELECT vote FROM community_alias_votes WHERE candidateId=c.id AND voterId=?) AS myVote FROM community_alias_candidates c`)} WHERE c.game=? AND c.status='voting' AND (c.voteOpenAt IS NULL OR c.voteOpenAt<=?) AND (c.voteCloseAt IS NULL OR c.voteCloseAt>?) ORDER BY c.voteCloseAt,c.createdAt DESC LIMIT ? OFFSET ?`,
+      userId,
+      this.game,
+      now,
+      now,
+      Math.min(200, limit),
+      offset,
+    );
+  }
+  async fetchMyCandidates(userId: string, limit: number, song?: string) {
+    return this.db.all(
+      `${detailSelect} WHERE c.game=? AND c.submitterId=? AND (? IS NULL OR c.songIdentifier=?) ORDER BY c.createdAt DESC LIMIT ?`,
+      this.game,
+      userId,
+      song ?? null,
+      song ?? null,
+      Math.min(200, limit),
+    );
+  }
+  async fetchMyDailyCount(userId: string, _date?: string) {
+    return (await this.db.get<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM community_alias_candidates WHERE game=? AND submitterId=? AND submittedLocalDate=?",
+      this.game,
+      userId,
+      today(),
+    ))!.count;
+  }
+  async vote(userId: string, id: string, vote: number) {
+    const candidate = await this.candidate(id),
+      now = nowISO();
+    if (
+      candidate.status !== "voting" ||
+      (candidate.voteCloseAt && candidate.voteCloseAt <= now)
+    )
+      throw new AppError(400, "candidate_not_voting", "Voting is closed.");
+    // Same vote toggles off. A changed vote is updated atomically, including the deadline check.
+    const open =
+      "EXISTS(SELECT 1 FROM community_alias_candidates WHERE id=? AND game=? AND status='voting' AND (voteOpenAt IS NULL OR voteOpenAt<=?) AND (voteCloseAt IS NULL OR voteCloseAt>?))";
+    const results = await this.db.batch([
+      this.db.statement(
+        `DELETE FROM community_alias_votes WHERE candidateId=? AND voterId=? AND vote=? AND ${open}`,
+        id,
+        userId,
+        vote,
+        id,
+        this.game,
+        now,
+        now,
+      ),
+      this.db.statement(
+        `INSERT INTO community_alias_votes(id,candidateId,voterId,vote,createdAt,updatedAt)
+    SELECT ?,?,?,?,?,? WHERE changes()=0 AND ${open}
+    ON CONFLICT(candidateId,voterId) DO UPDATE SET vote=excluded.vote,updatedAt=excluded.updatedAt`,
+        crypto.randomUUID(),
+        id,
+        userId,
+        vote,
+        now,
+        now,
+        id,
+        this.game,
+        now,
+        now,
+      ),
+    ]);
+    if (!results[0].meta.changes && !results[1].meta.changes)
+      throw new AppError(400, "candidate_not_voting", "Voting is closed.");
+    const counts = await this.db.get<{
+      supportCount: number;
+      opposeCount: number;
+    }>(
+      "SELECT COUNT(CASE WHEN vote=1 THEN 1 END) AS supportCount,COUNT(CASE WHEN vote=-1 THEN 1 END) AS opposeCount FROM community_alias_votes WHERE candidateId=?",
+      id,
+    );
+    return {
+      candidateId: id,
+      myVote: results[0].meta.changes ? null : vote,
+      ...counts,
+    };
+  }
+  async approvedSync(_since: Date | null, _limit: number) {
+    return this.db.all(
+      `SELECT id AS candidateId,songIdentifier,aliasText,status,updatedAt,createdAt AS approvedAt FROM aliases WHERE game=? AND source='community' ORDER BY updatedAt,id`,
+      this.game,
+    );
+  }
+  async rollCycle() {
+    const ids = await this.db.all<{ id: string }>(
+      "SELECT id FROM community_alias_candidates WHERE game=? AND status='voting' AND voteCloseAt<=? ORDER BY voteCloseAt LIMIT 100",
+      this.game,
+      nowISO(),
+    );
+    let settledCount = 0;
+    for (const { id } of ids) {
+      const now = nowISO();
+      const approval = `((SELECT COUNT(*) FROM community_alias_votes WHERE candidateId=community_alias_candidates.id AND vote=1)>=3 AND (SELECT COALESCE(SUM(vote),0) FROM community_alias_votes WHERE candidateId=community_alias_candidates.id)>0)`;
+      const results = await this.db.batch([
+        this.db.statement(
+          `UPDATE community_alias_candidates SET status=CASE WHEN ${approval} THEN 'approved' ELSE 'rejected' END,rejectionSource=CASE WHEN ${approval} THEN NULL ELSE 'community_vote' END,approvedAt=CASE WHEN ${approval} THEN ? ELSE NULL END,rejectedAt=CASE WHEN ${approval} THEN NULL ELSE ? END,updatedAt=? WHERE id=? AND game=? AND status='voting' AND voteCloseAt<=?`,
+          now,
+          now,
+          now,
+          id,
+          this.game,
+          now,
+        ),
+        this.aliasUpsert(id),
+      ]);
+      settledCount += results[0].meta.changes;
+    }
+    return { settledCount };
+  }
+  private aliasUpsert(id: string) {
+    return this.db.statement(
+      `INSERT INTO aliases(id,game,songIdentifier,aliasText,aliasNorm,source,status,createdAt,updatedAt)
+   SELECT id,game,songIdentifier,aliasText,aliasNorm,'community','approved',createdAt,updatedAt FROM community_alias_candidates WHERE id=? AND game=? AND status='approved'
+   ON CONFLICT(game,songIdentifier,aliasNorm,source) DO UPDATE SET aliasText=excluded.aliasText,status='approved',updatedAt=excluded.updatedAt`,
+      id,
+      this.game,
+    );
+  }
+  async adminDashboardStats() {
+    return this.db.get(
+      `SELECT COUNT(*) AS totalCount,COUNT(CASE WHEN status='voting' THEN 1 END) AS votingCount,COUNT(CASE WHEN status='approved' THEN 1 END) AS approvedCount,COUNT(CASE WHEN status='rejected' THEN 1 END) AS rejectedCount,COUNT(CASE WHEN status='voting' AND voteCloseAt<=? THEN 1 END) AS expiredVotingCount,COUNT(CASE WHEN status='voting' AND voteCloseAt>? AND voteCloseAt<=? THEN 1 END) AS closingSoonCount,COUNT(CASE WHEN submittedLocalDate=? THEN 1 END) AS todaySubmissions FROM community_alias_candidates WHERE game=?`,
+      nowISO(),
+      nowISO(),
+      new Date(Date.now() + 86400_000).toISOString(),
+      today(),
+      this.game,
+    );
+  }
+  async adminListCandidates(input: {
+    status?: string | null;
+    search?: string | null;
+    sort?: string | null;
+    limit: number;
+    offset: number;
+  }) {
+    const sorts: Record<string, string> = {
+      deadline_asc: "c.voteCloseAt ASC",
+      created_desc: "c.createdAt DESC",
+      created_asc: "c.createdAt ASC",
+      updated_asc: "c.updatedAt ASC",
+      updated_desc: "c.updatedAt DESC",
+    };
+    const filter = `c.game=? AND (?='all' OR c.status=?) AND (c.songIdentifier LIKE ? OR c.aliasText LIKE ?)`;
+    const status = input.status ?? "all",
+      search = `%${input.search ?? ""}%`,
+      values: SqlValue[] = [this.game, status, status, search, search];
+    const count = await this.db.get<{ totalCount: number }>(
+      `SELECT COUNT(*) AS totalCount FROM community_alias_candidates c WHERE ${filter}`,
+      ...values,
+    );
+    const rows = await this.db.all<Record<string, unknown>>(
+      `${detailSelect} WHERE ${filter} ORDER BY ${sorts[input.sort ?? "updated_desc"] ?? sorts.updated_desc} LIMIT ? OFFSET ?`,
+      ...values,
+      input.limit,
+      input.offset,
+    );
+    return rows.map((row) => ({ ...row, totalCount: count!.totalCount }));
+  }
+  async adminCreateCandidate(input: {
+    submitterId: string;
+    songIdentifier: string;
+    aliasText: string;
+    status: "voting" | "approved";
+  }) {
+    await this.catalogAliases(input.songIdentifier);
+    const norm = normalizeAlias(input.aliasText),
+      id = crypto.randomUUID(),
+      now = nowISO();
+    if (!norm) throw new AppError(400, "invalid_request", "Invalid alias.");
+    await this.db.batch([
+      this.db.statement(
+        "INSERT INTO community_alias_candidates(id,game,songIdentifier,aliasText,aliasNorm,submitterId,status,voteOpenAt,voteCloseAt,approvedAt,submittedLocalDate,createdAt,updatedAt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        id,
+        this.game,
+        input.songIdentifier,
+        input.aliasText.trim(),
+        norm,
+        input.submitterId,
+        input.status,
+        now,
+        new Date(Date.now() + 72 * 3600_000).toISOString(),
+        input.status === "approved" ? now : null,
+        today(),
+        now,
+        now,
+      ),
+      this.aliasUpsert(id),
+    ]);
+    return this.candidate(id);
+  }
+  async adminSetStatus(id: string, status: "voting" | "approved" | "rejected") {
+    const row = await this.candidate(id),
+      now = nowISO();
+    await this.db.batch([
+      this.db.statement(
+        "UPDATE community_alias_candidates SET status=?,rejectionSource=?,approvedAt=?,rejectedAt=?,voteOpenAt=?,voteCloseAt=?,updatedAt=? WHERE id=? AND game=?",
+        status,
+        status === "rejected" ? "admin_manual" : null,
+        status === "approved" ? now : null,
+        status === "rejected" ? now : null,
+        now,
+        status === "voting"
+          ? new Date(Date.now() + 72 * 3600_000).toISOString()
+          : now,
+        now,
+        id,
+        this.game,
+      ),
+      this.db.statement(
+        "UPDATE aliases SET status='rejected',updatedAt=? WHERE game=? AND songIdentifier=? AND aliasNorm=? AND source='community' AND ?<>'approved'",
+        now,
+        this.game,
+        row.songIdentifier,
+        row.aliasNorm,
+        status,
+      ),
+      this.aliasUpsert(id),
+    ]);
+    return this.candidate(id);
+  }
+  async adminUpdateVoteWindow(id: string, close: Date) {
+    await this.candidate(id);
+    if (close <= new Date())
+      throw new AppError(
+        400,
+        "invalid_vote_close_at",
+        "Deadline must be in the future.",
+      );
+    await this.db.run(
+      "UPDATE community_alias_candidates SET voteOpenAt=?,voteCloseAt=?,updatedAt=? WHERE id=? AND game=? AND status='voting'",
+      nowISO(),
+      close.toISOString(),
+      nowISO(),
+      id,
+      this.game,
+    );
+    return this.candidate(id);
+  }
 }

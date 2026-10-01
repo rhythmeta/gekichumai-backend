@@ -1,218 +1,107 @@
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { inject, injectable } from "tsyringe";
 import type { Env } from "../env.js";
-import { TOKENS } from "../di/tokens.js";
 import { AppError } from "../lib/errors.js";
-
-@injectable()
 export class StorageService {
-	private readonly client: S3Client | null;
-	private readonly signingClient: S3Client | null;
-
-	constructor(@inject(TOKENS.Env) private readonly env: Env) {
-		const endpoint = env.S3_ENDPOINT;
-		const signingEndpoint = env.S3_PUBLIC_ENDPOINT ?? endpoint;
-		const accessKeyId = env.S3_ACCESS_KEY_ID;
-		const secretAccessKey = env.S3_SECRET_ACCESS_KEY;
-		if (!endpoint || !signingEndpoint || !accessKeyId || !secretAccessKey) {
-			this.client = null;
-			this.signingClient = null;
-			return;
-		}
-
-		const baseConfig = {
-			region: env.S3_REGION,
-			credentials: {
-				accessKeyId,
-				secretAccessKey,
-			},
-			// R2 supports path style, and MinIO required it.
-			forcePathStyle: true,
-			// Without this the SDK computes a CRC32 over the *empty* body at signing
-			// time and bakes `x-amz-checksum-crc32` into the presigned query string.
-			// The client then PUTs real bytes against a signature that promises an
-			// empty-body checksum, and R2 rejects the upload. The parameter is signed,
-			// so the client can neither drop it nor satisfy it.
-			requestChecksumCalculation: "WHEN_REQUIRED",
-			// R2 does not return the trailing checksums the SDK would try to validate.
-			responseChecksumValidation: "WHEN_REQUIRED",
-		} as const;
-
-		this.client = new S3Client({
-			endpoint,
-			...baseConfig,
-		});
-		this.signingClient = new S3Client({
-			endpoint: signingEndpoint,
-			...baseConfig,
-		});
-	}
-
-	async createAvatarUploadUrl(profileId: string, contentType: string): Promise<{ key: string; uploadUrl: string }> {
-		if (!this.signingClient) {
-			throw new AppError(500, "storage_not_configured", "S3 storage is not configured.");
-		}
-		const key = `avatars/profiles/${profileId}`;
-		const command = new PutObjectCommand({
-			Bucket: this.env.S3_BUCKET,
-			Key: key,
-			ContentType: contentType,
-		});
-
-		const uploadUrl = await getSignedUrl(this.signingClient, command, { expiresIn: 300 });
-		return { key, uploadUrl };
-	}
-
-	async deleteAvatar(profileId: string) {
-		if (!this.client) {
-			throw new AppError(500, "storage_not_configured", "S3 storage is not configured.");
-		}
-
-		await this.client.send(
-			new DeleteObjectCommand({
-				Bucket: this.env.S3_BUCKET,
-				Key: `avatars/profiles/${profileId}`,
-			}),
-		);
-	}
-
-	async getObject(
-		key: string,
-	): Promise<{ body: BodyInit; contentType: string | null; etag: string | null; lastModified: Date | null }> {
-		if (!this.client) {
-			throw new AppError(500, "storage_not_configured", "S3 storage is not configured.");
-		}
-		return this.getObjectFromBucket(this.client, this.env.S3_BUCKET, key, "avatar_not_found", "Avatar object not found.");
-	}
-
-	private async getObjectFromBucket(
-		client: S3Client,
-		bucket: string,
-		key: string,
-		notFoundCode: string,
-		notFoundMessage: string,
-	): Promise<{ body: BodyInit; contentType: string | null; etag: string | null; lastModified: Date | null }> {
-		try {
-			const result = await client.send(
-				new GetObjectCommand({
-					Bucket: bucket,
-					Key: key,
-				}),
-			);
-
-			if (!result.Body) {
-				throw new AppError(404, notFoundCode, notFoundMessage);
-			}
-
-			const body = await this.toBodyInit(result.Body);
-			return {
-				body,
-				contentType: result.ContentType ?? null,
-				etag: result.ETag ?? null,
-				lastModified: result.LastModified ?? null,
-			};
-		} catch (error) {
-			const statusCode = this.readHttpStatus(error);
-			if (statusCode === 404) {
-				throw new AppError(404, notFoundCode, notFoundMessage);
-			}
-			throw error;
-		}
-	}
-
-	private async toBodyInit(body: unknown): Promise<BodyInit> {
-		if (body instanceof ReadableStream) {
-			return body;
-		}
-		if (body instanceof Uint8Array) {
-			return this.toArrayBuffer(body);
-		}
-		if (typeof body === "string") {
-			return body;
-		}
-		if (body instanceof ArrayBuffer) {
-			return body;
-		}
-
-		if (body instanceof Blob) {
-			return body;
-		}
-
-		if (
-			typeof body === "object" &&
-			body !== null &&
-			"transformToWebStream" in body &&
-			typeof body.transformToWebStream === "function"
-		) {
-			return body.transformToWebStream() as ReadableStream;
-		}
-
-		if (
-			typeof body === "object" &&
-			body !== null &&
-			"transformToByteArray" in body &&
-			typeof body.transformToByteArray === "function"
-		) {
-			const bytes = (await body.transformToByteArray()) as Uint8Array;
-			return this.toArrayBuffer(bytes);
-		}
-
-		if (this.isAsyncIterable(body)) {
-			const chunks: Uint8Array[] = [];
-			for await (const chunk of body) {
-				if (chunk instanceof Uint8Array) {
-					chunks.push(chunk);
-					continue;
-				}
-
-				if (typeof chunk === "string") {
-					chunks.push(new TextEncoder().encode(chunk));
-					continue;
-				}
-
-				if (chunk instanceof ArrayBuffer) {
-					chunks.push(new Uint8Array(chunk));
-				}
-			}
-			return this.concatChunks(chunks);
-		}
-
-		throw new AppError(500, "storage_stream_error", "Unsupported storage body stream type.");
-	}
-
-	private concatChunks(chunks: Uint8Array[]) {
-		const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-		const merged = new Uint8Array(totalLength);
-		let offset = 0;
-		for (const chunk of chunks) {
-			merged.set(chunk, offset);
-			offset += chunk.length;
-		}
-		return merged.buffer;
-	}
-
-	private toArrayBuffer(value: Uint8Array) {
-		const copy = new Uint8Array(value.byteLength);
-		copy.set(value);
-		return copy.buffer;
-	}
-
-	private isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-		return typeof value === "object" && value !== null && Symbol.asyncIterator in value;
-	}
-
-	private readHttpStatus(error: unknown): number | null {
-		if (typeof error !== "object" || error === null || !("$metadata" in error)) {
-			return null;
-		}
-
-		const metadata = error.$metadata;
-		if (typeof metadata !== "object" || metadata === null || !("httpStatusCode" in metadata)) {
-			return null;
-		}
-
-		const status = metadata.httpStatusCode;
-		return typeof status === "number" ? status : null;
-	}
+  private readonly client: S3Client;
+  constructor(
+    private readonly env: Env,
+    private readonly bucket: R2Bucket,
+  ) {
+    this.client = new S3Client({
+      endpoint: env.S3_ENDPOINT,
+      region: env.S3_REGION,
+      credentials: {
+        accessKeyId: env.S3_ACCESS_KEY_ID,
+        secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+      },
+      forcePathStyle: true,
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
+    });
+  }
+  publicUrl(key: string) {
+    return `${this.env.S3_PUBLIC_BASE_URL.replace(/\/+$/, "")}/${key.split("/").map(encodeURIComponent).join("/")}`;
+  }
+  async uploadUrl(key: string, size: number) {
+    return getSignedUrl(
+      this.client,
+      new PutObjectCommand({
+        Bucket: this.env.S3_BUCKET,
+        Key: key,
+        ContentType: "application/octet-stream",
+        ContentLength: size,
+        CacheControl: "no-store",
+      }),
+      {
+        expiresIn: 300,
+        signableHeaders: new Set([
+          "content-length",
+          "content-type",
+          "cache-control",
+        ]),
+      },
+    );
+  }
+  async finalize(
+    uploadKey: string,
+    objectKey: string,
+    size: number,
+    sha256: string,
+  ) {
+    const existing = await this.bucket.head(objectKey);
+    if (existing) {
+      this.verify(existing, size, sha256);
+      return;
+    }
+    const source = await this.bucket.get(uploadKey);
+    if (!source)
+      throw new AppError(409, "upload_missing", "Upload has not completed.");
+    if (source.size !== size) {
+      await source.body.cancel();
+      throw new AppError(
+        400,
+        "backup_size_mismatch",
+        "Backup size does not match.",
+      );
+    }
+    // R2 checks the supplied SHA-256 while streaming; the Worker never buffers the backup.
+    const result = await this.bucket.put(objectKey, source.body, {
+      sha256,
+      onlyIf: { etagDoesNotMatch: "*" },
+      httpMetadata: {
+        contentType: "application/octet-stream",
+        cacheControl: "no-store",
+      },
+    });
+    if (!result) {
+      const committed = await this.bucket.head(objectKey);
+      if (!committed)
+        throw new AppError(
+          409,
+          "backup_commit_conflict",
+          "Retry backup commit.",
+        );
+      this.verify(committed, size, sha256);
+    }
+  }
+  private verify(object: R2Object, size: number, sha256: string) {
+    const hash = object.checksums.sha256
+      ? Buffer.from(object.checksums.sha256).toString("hex")
+      : null;
+    if (object.size !== size || hash !== sha256)
+      throw new AppError(
+        409,
+        "backup_checksum_mismatch",
+        "Backup checksum does not match.",
+      );
+  }
+  async delete(key: string) {
+    if (
+      !/^backups\/(?:maimaid|chunithmd)\/[a-f0-9-]+\.pb\.gz$/.test(key) &&
+      !/^backup-uploads\/[a-f0-9-]+$/.test(key)
+    )
+      throw new Error("Refusing to delete outside backup prefixes");
+    await this.bucket.delete(key);
+  }
 }

@@ -1,4 +1,4 @@
 export const TOKENS = {
-	Env: Symbol.for("Env"),
-	Prisma: Symbol.for("Prisma"),
+  Env: Symbol.for("Env"),
+  Database: Symbol.for("Database"),
 } as const;

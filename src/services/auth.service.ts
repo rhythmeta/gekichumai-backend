@@ -1,885 +1,591 @@
 import { compare, hash } from "bcryptjs";
 import { inject, injectable } from "tsyringe";
-import type { PrismaClient, User } from "@prisma/client";
 import { TOKENS } from "../di/tokens.js";
+import { Database, normalizeUser, nowISO, type User } from "../db/database.js";
 import { AppError } from "../lib/errors.js";
 import { JwtService } from "./jwt.service.js";
 import type { Env } from "../env.js";
 import { randomToken, sha256Hex } from "../lib/crypto.js";
-import { isPasswordComplexEnough, PASSWORD_COMPLEXITY_ERROR_MESSAGE } from "../lib/auth-validation.js";
-import { assignUserHandle } from "../lib/user-handle.js";
+import { sanitizeUsername } from "../lib/user-handle.js";
+import { isPasswordComplexEnough } from "../lib/auth-validation.js";
 import {
-	createOpaqueRegistrationResponse,
-	finishOpaqueLogin,
-	hashPasswordFingerprint,
-	normalizeOpaqueEnvelope,
-	startOpaqueLogin,
+  createOpaqueRegistrationResponse,
+  finishOpaqueLogin,
+  hashPasswordFingerprint,
+  normalizeOpaqueEnvelope,
+  startOpaqueLogin,
 } from "../lib/opaque-password.js";
 
-type TokenPair = {
-	accessToken: string;
-	refreshToken: string;
-	expiresIn: number;
-};
-
-type OpaqueLoginStartResult =
-	| {
-			protocol: "legacy-bcrypt";
-	  }
-	| {
-			protocol: "opaque";
-			challengeToken: string;
-			loginResponse: string;
-	  };
-
-const APP_SESSION_CODE_TTL_SECONDS = 120;
-const EMAIL_VERIFICATION_TOKEN_TTL_MS = 60 * 60_000;
-
-type AuthEmailType = "verify" | "reset";
-type AuthChannel = "web" | "app";
-
 export type AuthEmailLinkContext = {
-	channel?: AuthChannel;
-	redirectUri?: string;
+  channel?: "web" | "app";
+  redirectUri?: string;
 };
+export type AppAuthorization = {
+  clientId: "maimaid" | "chunithmd";
+  redirectUri: string;
+  codeChallenge: string;
+};
+export type AppExchange = {
+  clientId: "maimaid" | "chunithmd";
+  redirectUri: string;
+  codeVerifier: string;
+};
+export type Challenge = {
+  id: string;
+  userId: string | null;
+  kind: string;
+  payload: string;
+  expiresAt: string;
+  consumedAt: string | null;
+};
+export const APP_CALLBACKS = {
+  maimaid: "maimaid://auth/callback",
+  chunithmd: "chunithmd://auth/callback",
+} as const;
 
 @injectable()
 export class AuthService {
-	constructor(
-		@inject(TOKENS.Prisma) private readonly prisma: PrismaClient,
-		@inject(JwtService) private readonly jwtService: JwtService,
-		@inject(TOKENS.Env) private readonly env: Env,
-	) {}
-
-	async login(email: string, password: string): Promise<{ user: User; tokens: TokenPair }> {
-		const user = await this.validateLoginCredentials(email, password);
-		const tokens = await this.issueTokensForUser(user);
-		return { user, tokens };
-	}
-
-	async validateLoginCredentials(email: string, password: string): Promise<User> {
-		const normalized = this.normalizeEmail(email);
-		const user = await this.prisma.user.findUnique({ where: { email: normalized } });
-		if (!user || user.status !== "active") {
-			throw new AppError(401, "invalid_credentials", "Email or password is incorrect.");
-		}
-		if (user.opaqueRegistrationRecord) {
-			throw new AppError(400, "opaque_required", "This account requires the OPAQUE login flow.");
-		}
-		if (!user.passwordHash) {
-			throw new AppError(400, "opaque_required", "This account requires the OPAQUE login flow.");
-		}
-
-		const ok = await compare(password, user.passwordHash);
-		if (!ok) {
-			throw new AppError(401, "invalid_credentials", "Email or password is incorrect.");
-		}
-
-		if (!user.emailVerifiedAt) {
-			throw new AppError(403, "email_not_verified", "Email is not verified. Please check your inbox.");
-		}
-
-		return user;
-	}
-
-	async startOpaqueRegistration(email: string, registrationRequest: string): Promise<{ registrationResponse: string }> {
-		const normalizedEmail = this.normalizeEmail(email);
-		const existing = await this.prisma.user.findUnique({
-			where: { email: normalizedEmail },
-			select: { id: true },
-		});
-		if (existing) {
-			throw new AppError(409, "email_exists", "Email already exists.");
-		}
-
-		return {
-			registrationResponse: await createOpaqueRegistrationResponse({
-				serverSetup: this.env.OPAQUE_SERVER_SETUP,
-				userIdentifier: normalizedEmail,
-				registrationRequest,
-			}),
-		};
-	}
-
-	async finishOpaqueRegistration(
-		email: string,
-		username: string,
-		registrationRecord: string,
-		passwordFingerprint: string,
-		emailLinkContext?: AuthEmailLinkContext,
-	): Promise<{ user: User; verificationEmailSent: boolean }> {
-		const normalizedEmail = this.normalizeEmail(email);
-		const existing = await this.prisma.user.findUnique({
-			where: { email: normalizedEmail },
-			select: { id: true },
-		});
-		if (existing) {
-			throw new AppError(409, "email_exists", "Email already exists.");
-		}
-
-		const fingerprintHash = await hashPasswordFingerprint(passwordFingerprint);
-		const normalizedRecord = normalizeOpaqueEnvelope(registrationRecord);
-		const user = await this.prisma.$transaction(async (tx) => {
-			const assignedHandle = await assignUserHandle(tx, {
-				requestedUsername: username,
-			});
-			const createdUser = await tx.user.create({
-				data: {
-					email: normalizedEmail,
-					passwordHash: null,
-					opaqueRegistrationRecord: normalizedRecord,
-					passwordFingerprintHash: fingerprintHash,
-					...assignedHandle,
-				},
-			});
-
-			await tx.profile.create({
-				data: {
-					userId: createdUser.id,
-					name: "Default",
-					server: "jp",
-					isActive: true,
-				},
-			});
-
-			return createdUser;
-		});
-
-		const verificationEmailSent = await this.sendVerificationEmail(user.id, user.email, false, emailLinkContext);
-		return { user, verificationEmailSent };
-	}
-
-	async startOpaqueLogin(email: string, startLoginRequest: string): Promise<OpaqueLoginStartResult> {
-		const normalizedEmail = this.normalizeEmail(email);
-		const user = await this.findActiveUserByEmail(normalizedEmail);
-		if (!user.emailVerifiedAt) {
-			throw new AppError(403, "email_not_verified", "Email is not verified. Please check your inbox.");
-		}
-		if (!user.opaqueRegistrationRecord) {
-			if (!user.passwordHash) {
-				throw new AppError(400, "opaque_required", "This account requires the OPAQUE login flow.");
-			}
-			return { protocol: "legacy-bcrypt" };
-		}
-
-		const challengeToken = randomToken(36);
-		const tokenHash = await sha256Hex(challengeToken);
-		const challenge = await startOpaqueLogin({
-			serverSetup: this.env.OPAQUE_SERVER_SETUP,
-			userIdentifier: normalizedEmail,
-			registrationRecord: user.opaqueRegistrationRecord,
-			startLoginRequest,
-		});
-
-		await this.prisma.opaqueLoginChallenge.create({
-			data: {
-				userId: user.id,
-				tokenHash,
-				serverLoginState: challenge.serverLoginState,
-				expiresAt: new Date(Date.now() + this.env.MFA_CHALLENGE_TTL_SECONDS * 1000),
-			},
-		});
-
-		return {
-			protocol: "opaque",
-			challengeToken,
-			loginResponse: challenge.loginResponse,
-		};
-	}
-
-	async finishOpaqueLogin(challengeToken: string, finishLoginRequest: string): Promise<User> {
-		const challenge = await this.findOpaqueLoginChallenge(challengeToken);
-
-		try {
-			await finishOpaqueLogin({
-				serverLoginState: challenge.serverLoginState,
-				finishLoginRequest,
-			});
-		} finally {
-			await this.consumeOpaqueLoginChallenge(challenge.id);
-		}
-
-		return challenge.user;
-	}
-
-	async startPasswordEnrollmentOpaque(userId: string, registrationRequest: string): Promise<{ registrationResponse: string }> {
-		const user = await this.findActiveUserById(userId);
-		return {
-			registrationResponse: await createOpaqueRegistrationResponse({
-				serverSetup: this.env.OPAQUE_SERVER_SETUP,
-				userIdentifier: user.email,
-				registrationRequest,
-			}),
-		};
-	}
-
-	async finishPasswordEnrollmentOpaque(userId: string, registrationRecord: string, passwordFingerprint: string): Promise<void> {
-		const user = await this.findActiveUserById(userId);
-		const normalizedRecord = normalizeOpaqueEnvelope(registrationRecord);
-		const fingerprintHash = await hashPasswordFingerprint(passwordFingerprint);
-
-		if (user.passwordFingerprintHash && user.passwordFingerprintHash === fingerprintHash) {
-			throw new AppError(400, "password_reused", "New password must be different from your current password.");
-		}
-
-		await this.prisma.user.update({
-			where: { id: user.id },
-			data: {
-				opaqueRegistrationRecord: normalizedRecord,
-				passwordFingerprintHash: fingerprintHash,
-				passwordHash: null,
-			},
-		});
-	}
-
-	async startOpaquePasswordReset(token: string, registrationRequest: string): Promise<{ registrationResponse: string; email: string }> {
-		const record = await this.getValidPasswordResetTokenRecord(token);
-		const user = await this.prisma.user.findUnique({
-			where: { id: record.userId },
-			select: { email: true, status: true },
-		});
-		if (!user || user.status !== "active") {
-			throw new AppError(400, "invalid_reset_token", "Password reset token is invalid.");
-		}
-		return {
-			registrationResponse: await createOpaqueRegistrationResponse({
-				serverSetup: this.env.OPAQUE_SERVER_SETUP,
-				userIdentifier: user.email,
-				registrationRequest,
-			}),
-			email: user.email,
-		};
-	}
-
-	async finishOpaquePasswordReset(token: string, registrationRecord: string, passwordFingerprint: string): Promise<void> {
-		const record = await this.getValidPasswordResetTokenRecord(token);
-		const user = await this.prisma.user.findUnique({
-			where: { id: record.userId },
-		});
-		if (!user || user.status !== "active") {
-			throw new AppError(400, "invalid_reset_token", "Password reset token is invalid.");
-		}
-
-		const normalizedRecord = normalizeOpaqueEnvelope(registrationRecord);
-		const fingerprintHash = await hashPasswordFingerprint(passwordFingerprint);
-		if (user.passwordFingerprintHash && user.passwordFingerprintHash === fingerprintHash) {
-			throw new AppError(400, "password_reused", "New password must be different from your current password.");
-		}
-
-		await this.prisma.$transaction([
-			this.prisma.user.update({
-				where: { id: record.userId },
-				data: {
-					passwordHash: null,
-					opaqueRegistrationRecord: normalizedRecord,
-					passwordFingerprintHash: fingerprintHash,
-				},
-			}),
-			this.prisma.refreshToken.updateMany({
-				where: {
-					userId: record.userId,
-					revokedAt: null,
-				},
-				data: {
-					revokedAt: new Date(),
-				},
-			}),
-			this.prisma.passwordResetToken.update({
-				where: { id: record.id },
-				data: { consumedAt: new Date() },
-			}),
-		]);
-	}
-
-	async issueTokensForUser(user: User): Promise<TokenPair> {
-		return this.issueTokenPair(user);
-	}
-
-	async findActiveUserById(userId: string): Promise<User> {
-		const user = await this.prisma.user.findUnique({
-			where: { id: userId },
-		});
-		if (!user || user.status !== "active") {
-			throw new AppError(401, "invalid_credentials", "User is not active.");
-		}
-		return user;
-	}
-
-	async updateUsername(userId: string, username: string): Promise<User> {
-		return this.prisma.$transaction(async (tx) => {
-			const existing = await tx.user.findUnique({
-				where: { id: userId },
-				select: {
-					id: true,
-					status: true,
-					usernameNormalized: true,
-					usernameDiscriminator: true,
-				},
-			});
-			if (!existing || existing.status !== "active") {
-				throw new AppError(401, "invalid_credentials", "User is not active.");
-			}
-
-			const assignedHandle = await assignUserHandle(tx, {
-				requestedUsername: username,
-				existingUser: existing,
-			});
-
-			return tx.user.update({
-				where: { id: userId },
-				data: assignedHandle,
-			});
-		});
-	}
-
-	async resendVerification(
-		email: string,
-		emailLinkContext?: AuthEmailLinkContext,
-	): Promise<{ verificationEmailSent: boolean }> {
-		const normalized = this.normalizeEmail(email);
-		const user = await this.prisma.user.findUnique({ where: { email: normalized } });
-		if (!user || user.emailVerifiedAt) {
-			return { verificationEmailSent: true };
-		}
-
-		const verificationEmailSent = await this.sendVerificationEmail(user.id, user.email, false, emailLinkContext);
-		return { verificationEmailSent };
-	}
-
-	async verifyEmail(token: string): Promise<User> {
-		const normalizedToken = token.trim();
-		if (!normalizedToken || normalizedToken.length < 20) {
-			throw new AppError(400, "invalid_verification_token", "Verification token is invalid.");
-		}
-
-		const tokenHash = await sha256Hex(normalizedToken);
-		const record = await this.prisma.emailVerificationToken.findUnique({
-			where: { tokenHash },
-		});
-		if (!record || record.consumedAt || record.expiresAt < new Date()) {
-			throw new AppError(400, "invalid_verification_token", "Verification token is invalid.");
-		}
-
-		const user = await this.prisma.$transaction(async (tx) => {
-			await tx.emailVerificationToken.update({
-				where: { id: record.id },
-				data: { consumedAt: new Date() },
-			});
-
-			return tx.user.update({
-				where: { id: record.userId },
-				data: { emailVerifiedAt: new Date() },
-			});
-		});
-
-		return user;
-	}
-
-	async refresh(refreshToken: string): Promise<{ user: User; tokens: TokenPair }> {
-		const refreshHash = await sha256Hex(refreshToken);
-		const record = await this.prisma.refreshToken.findUnique({
-			where: { tokenHash: refreshHash },
-			include: { user: true },
-		});
-		if (!record || record.revokedAt || record.expiresAt < new Date() || record.user.status !== "active") {
-			throw new AppError(401, "invalid_refresh_token", "Invalid refresh token.");
-		}
-
-		await this.prisma.refreshToken.update({
-			where: { id: record.id },
-			data: { revokedAt: new Date() },
-		});
-
-		const tokens = await this.issueTokenPair(record.user);
-		return { user: record.user, tokens };
-	}
-
-	async logout(refreshToken: string): Promise<void> {
-		const refreshHash = await sha256Hex(refreshToken);
-		await this.prisma.refreshToken.updateMany({
-			where: {
-				tokenHash: refreshHash,
-				revokedAt: null,
-			},
-			data: {
-				revokedAt: new Date(),
-			},
-		});
-	}
-
-	async forgotPassword(email: string, emailLinkContext?: AuthEmailLinkContext): Promise<{ resetEmailSent: boolean }> {
-		const normalized = this.normalizeEmail(email);
-		const user = await this.prisma.user.findUnique({ where: { email: normalized } });
-		if (!user) {
-			return { resetEmailSent: true };
-		}
-
-		const token = await this.createPasswordResetToken(user.id);
-		const resetEmailSent = await this.sendResetPasswordEmail(user.email, token, emailLinkContext);
-		return { resetEmailSent };
-	}
-
-	async findActiveVerifiedUserByEmail(email: string): Promise<User> {
-		const normalized = this.normalizeEmail(email);
-		const user = await this.prisma.user.findUnique({ where: { email: normalized } });
-		if (!user || user.status !== "active") {
-			throw new AppError(401, "invalid_credentials", "Email or password is incorrect.");
-		}
-		if (!user.emailVerifiedAt) {
-			throw new AppError(403, "email_not_verified", "Email is not verified. Please check your inbox.");
-		}
-		return user;
-	}
-
-	async validatePasswordResetToken(token: string): Promise<{ email: string }> {
-		const record = await this.getValidPasswordResetTokenRecord(token);
-		const user = await this.prisma.user.findUnique({
-			where: { id: record.userId },
-			select: { email: true, status: true },
-		});
-		if (!user || user.status !== "active") {
-			throw new AppError(400, "invalid_reset_token", "Password reset token is invalid.");
-		}
-		return { email: user.email };
-	}
-
-	async resetPassword(token: string, newPassword: string): Promise<void> {
-		this.validatePassword(newPassword);
-		const record = await this.getValidPasswordResetTokenRecord(token);
-		const user = await this.prisma.user.findUnique({
-			where: { id: record.userId },
-		});
-		if (!user) {
-			throw new AppError(404, "user_not_found", "User not found.");
-		}
-		if (user.opaqueRegistrationRecord || !user.passwordHash) {
-			throw new AppError(400, "opaque_required", "This account requires the OPAQUE password reset flow.");
-		}
-
-		const sameAsCurrent = await compare(newPassword, user.passwordHash);
-		if (sameAsCurrent) {
-			throw new AppError(400, "password_reused", "New password must be different from your current password.");
-		}
-
-		const passwordHash = await hash(newPassword, 12);
-		await this.prisma.$transaction([
-			this.prisma.user.update({
-				where: { id: record.userId },
-				data: { passwordHash },
-			}),
-			this.prisma.refreshToken.updateMany({
-				where: {
-					userId: record.userId,
-					revokedAt: null,
-				},
-				data: {
-					revokedAt: new Date(),
-				},
-			}),
-			this.prisma.passwordResetToken.update({
-				where: { id: record.id },
-				data: { consumedAt: new Date() },
-			}),
-		]);
-	}
-
-	async createSessionCodeForUser(userId: string): Promise<string> {
-		const sessionCode = randomToken(36);
-		const codeHash = await sha256Hex(sessionCode);
-		const expiresAt = new Date(Date.now() + APP_SESSION_CODE_TTL_SECONDS * 1000);
-
-		await this.prisma.authSessionCode.create({
-			data: {
-				userId,
-				codeHash,
-				expiresAt,
-			},
-		});
-
-		return sessionCode;
-	}
-
-	async exchangeSessionCode(sessionCode: string): Promise<{ user: User; tokens: TokenPair }> {
-		const record = await this.consumeSessionCode(sessionCode);
-		const user = record.user;
-		if (user.status !== "active") {
-			throw new AppError(401, "invalid_session_code", "Session code is invalid.");
-		}
-		if (!user.emailVerifiedAt) {
-			throw new AppError(403, "email_not_verified", "Email is not verified. Please check your inbox.");
-		}
-		const tokens = await this.issueTokenPair(user);
-		return { user, tokens };
-	}
-
-	private async findActiveUserByEmail(email: string): Promise<User> {
-		const user = await this.prisma.user.findUnique({
-			where: { email },
-		});
-		if (!user || user.status !== "active") {
-			throw new AppError(401, "invalid_credentials", "Email or password is incorrect.");
-		}
-		return user;
-	}
-
-	private async findOpaqueLoginChallenge(challengeToken: string) {
-		const normalizedToken = challengeToken.trim();
-		if (!normalizedToken || normalizedToken.length < 20) {
-			throw new AppError(400, "invalid_opaque_challenge", "Opaque login challenge is invalid.");
-		}
-
-		const tokenHash = await sha256Hex(normalizedToken);
-		const challenge = await this.prisma.opaqueLoginChallenge.findUnique({
-			where: { tokenHash },
-			include: { user: true },
-		});
-		if (!challenge || challenge.consumedAt || challenge.expiresAt <= new Date()) {
-			throw new AppError(400, "invalid_opaque_challenge", "Opaque login challenge is invalid.");
-		}
-		if (challenge.user.status !== "active") {
-			throw new AppError(401, "invalid_credentials", "Email or password is incorrect.");
-		}
-		if (!challenge.user.emailVerifiedAt) {
-			throw new AppError(403, "email_not_verified", "Email is not verified. Please check your inbox.");
-		}
-		return challenge;
-	}
-
-	private async consumeOpaqueLoginChallenge(challengeId: string): Promise<void> {
-		await this.prisma.opaqueLoginChallenge.updateMany({
-			where: {
-				id: challengeId,
-				consumedAt: null,
-			},
-			data: {
-				consumedAt: new Date(),
-			},
-		});
-	}
-
-	private async issueTokenPair(user: User): Promise<TokenPair> {
-		const accessToken = await this.jwtService.signAccessToken({
-			sub: user.id,
-			email: user.email,
-			isAdmin: user.isAdmin,
-		});
-
-		const refreshToken = randomToken();
-		const refreshHash = await sha256Hex(refreshToken);
-		const expiresAt = new Date(Date.now() + this.env.JWT_REFRESH_TTL_SECONDS * 1000);
-
-		await this.prisma.refreshToken.create({
-			data: {
-				userId: user.id,
-				tokenHash: refreshHash,
-				expiresAt,
-			},
-		});
-
-		return {
-			accessToken,
-			refreshToken,
-			expiresIn: this.env.JWT_ACCESS_TTL_SECONDS,
-		};
-	}
-
-	private normalizeEmail(email: string): string {
-		const normalized = email.trim().toLowerCase();
-		if (!normalized || !normalized.includes("@")) {
-			throw new AppError(400, "invalid_email", "A valid email is required.");
-		}
-		return normalized;
-	}
-
-	private validatePassword(password: string): void {
-		if (!isPasswordComplexEnough(password)) {
-			throw new AppError(400, "invalid_password", PASSWORD_COMPLEXITY_ERROR_MESSAGE);
-		}
-	}
-
-	private async createPasswordResetToken(userId: string): Promise<string> {
-		const token = randomToken();
-		const tokenHash = await sha256Hex(token);
-		const expiresAt = new Date(Date.now() + 15 * 60_000);
-
-		await this.prisma.passwordResetToken.create({
-			data: {
-				userId,
-				tokenHash,
-				expiresAt,
-			},
-		});
-
-		return token;
-	}
-
-	private async sendVerificationEmail(
-		userId: string,
-		email: string,
-		enforceRateLimit: boolean,
-		emailLinkContext?: AuthEmailLinkContext,
-	): Promise<boolean> {
-		const token = await this.createEmailVerificationToken(userId, enforceRateLimit);
-		const verifyUrl = this.buildAuthActionUrl("verify-email", token, emailLinkContext);
-
-		return this.sendEmail({
-			to: email,
-			subject: "maimaid email verification",
-			html: this.renderAuthEmailTemplate({
-				title: "Verify your email",
-				description:
-					"Confirm this email address to finish setting up your maimaid Dashboard account. This link expires in 1 hour.",
-				buttonLabel: "Verify email",
-				actionUrl: verifyUrl,
-			}),
-			type: "verify",
-		});
-	}
-
-	private async sendResetPasswordEmail(
-		email: string,
-		token: string,
-		emailLinkContext?: AuthEmailLinkContext,
-	): Promise<boolean> {
-		const resetUrl = this.buildAuthActionUrl("password-reset", token, emailLinkContext);
-
-		return this.sendEmail({
-			to: email,
-			subject: "maimaid password reset",
-			html: this.renderAuthEmailTemplate({
-				title: "Reset your password",
-				description: "Use the link below to choose a new password for your maimaid Dashboard account.",
-				buttonLabel: "Reset password",
-				actionUrl: resetUrl,
-			}),
-			type: "reset",
-		});
-	}
-
-	private async sendEmail(input: { to: string; subject: string; html: string; type: AuthEmailType }): Promise<boolean> {
-		if (!this.env.RESEND_API_KEY) {
-			return false;
-		}
-
-		try {
-			const response = await fetch("https://api.resend.com/emails", {
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${this.env.RESEND_API_KEY}`,
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({
-					from: this.env.RESEND_FROM_EMAIL,
-					to: [input.to],
-					subject: input.subject,
-					html: input.html,
-				}),
-			});
-
-			return response.ok;
-		} catch {
-			return false;
-		}
-	}
-
-	private renderAuthEmailTemplate(input: {
-		title: string;
-		description: string;
-		buttonLabel: string;
-		actionUrl: string;
-	}): string {
-		const escapedTitle = this.escapeHtml(input.title);
-		const escapedDescription = this.escapeHtml(input.description);
-		const escapedButtonLabel = this.escapeHtml(input.buttonLabel);
-		const escapedUrl = this.escapeHtml(input.actionUrl);
-
-		return [
-			"<!doctype html>",
-			'<html lang="en">',
-			"<head>",
-			'<meta charset="utf-8" />',
-			'<meta name="viewport" content="width=device-width, initial-scale=1" />',
-			`<title>${escapedTitle}</title>`,
-			"</head>",
-			'<body style="margin:0;padding:0;background:#f4f4f5;">',
-			'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;background:#f4f4f5;">',
-			"<tr>",
-			'<td align="center" style="padding:24px 12px;">',
-			'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:560px;border-collapse:separate;background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;">',
-			"<tr>",
-			"<td style=\"padding:24px 24px 0 24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827;font-size:22px;line-height:1.3;font-weight:700;\">",
-			escapedTitle,
-			"</td>",
-			"</tr>",
-			"<tr>",
-			"<td style=\"padding:12px 24px 0 24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#3f3f46;font-size:15px;line-height:1.6;\">",
-			escapedDescription,
-			"</td>",
-			"</tr>",
-			"<tr>",
-			'<td style="padding:20px 24px 0 24px;">',
-			`<a href="${escapedUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1;font-weight:700;padding:12px 18px;border-radius:10px;">${escapedButtonLabel}</a>`,
-			"</td>",
-			"</tr>",
-			"<tr>",
-			"<td style=\"padding:16px 24px 0 24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f5132;font-size:13px;line-height:1.7;\">",
-			"If the button does not work, open this link:",
-			"</td>",
-			"</tr>",
-			"<tr>",
-			"<td style=\"padding:4px 24px 0 24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.7;word-break:break-all;\">",
-			`<a href="${escapedUrl}" style="color:#2563eb;text-decoration:underline;">${escapedUrl}</a>`,
-			"</td>",
-			"</tr>",
-			"<tr>",
-			"<td style=\"padding:16px 24px 24px 24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#71717a;font-size:12px;line-height:1.7;\">",
-			"If you did not request this email, you can ignore it.",
-			"</td>",
-			"</tr>",
-			"</table>",
-			"</td>",
-			"</tr>",
-			"</table>",
-			"</body>",
-			"</html>",
-		].join("");
-	}
-
-	private async createEmailVerificationToken(userId: string, enforceRateLimit: boolean): Promise<string> {
-		if (enforceRateLimit) {
-			const minuteAgo = new Date(Date.now() - 60_000);
-			const recentCount = await this.prisma.emailVerificationToken.count({
-				where: {
-					userId,
-					createdAt: {
-						gte: minuteAgo,
-					},
-				},
-			});
-			if (recentCount > 0) {
-				throw new AppError(429, "email_rate_limited", "You can request only one auth email per minute.");
-			}
-		}
-
-		const token = randomToken();
-		const tokenHash = await sha256Hex(token);
-		const expiresAt = new Date(Date.now() + EMAIL_VERIFICATION_TOKEN_TTL_MS);
-		await this.prisma.emailVerificationToken.create({
-			data: {
-				userId,
-				tokenHash,
-				expiresAt,
-			},
-		});
-		return token;
-	}
-
-	private async getValidPasswordResetTokenRecord(token: string) {
-		const normalizedToken = token.trim();
-		if (!normalizedToken || normalizedToken.length < 20) {
-			throw new AppError(400, "invalid_reset_token", "Password reset token is invalid.");
-		}
-
-		const tokenHash = await sha256Hex(normalizedToken);
-		const record = await this.prisma.passwordResetToken.findUnique({
-			where: { tokenHash },
-		});
-		if (!record || record.consumedAt || record.expiresAt < new Date()) {
-			throw new AppError(400, "invalid_reset_token", "Password reset token is invalid.");
-		}
-
-		return record;
-	}
-
-	private async consumeSessionCode(sessionCode: string) {
-		const normalizedCode = sessionCode.trim();
-		if (!normalizedCode || normalizedCode.length < 20) {
-			throw new AppError(400, "invalid_session_code", "Session code is invalid.");
-		}
-
-		const codeHash = await sha256Hex(normalizedCode);
-		const record = await this.prisma.authSessionCode.findUnique({
-			where: { codeHash },
-			include: { user: true },
-		});
-
-		if (!record || record.consumedAt || record.expiresAt < new Date()) {
-			throw new AppError(400, "invalid_session_code", "Session code is invalid.");
-		}
-
-		const consumed = await this.prisma.authSessionCode.updateMany({
-			where: {
-				id: record.id,
-				consumedAt: null,
-				expiresAt: {
-					gt: new Date(),
-				},
-			},
-			data: {
-				consumedAt: new Date(),
-			},
-		});
-		if (consumed.count !== 1) {
-			throw new AppError(400, "invalid_session_code", "Session code is invalid.");
-		}
-
-		return record;
-	}
-
-	private resolvePublicBaseUrl(): string {
-		const raw = this.env.APP_PUBLIC_URL?.trim() || `http://localhost:${this.env.PORT}`;
-		return raw.replace(/\/+$/, "");
-	}
-
-	private escapeHtml(value: string): string {
-		return value
-			.replaceAll("&", "&amp;")
-			.replaceAll("<", "&lt;")
-			.replaceAll(">", "&gt;")
-			.replaceAll('"', "&quot;")
-			.replaceAll("'", "&#39;");
-	}
-
-	private buildAuthActionUrl(
-		action: "verify-email" | "password-reset",
-		token: string,
-		emailLinkContext?: AuthEmailLinkContext,
-	): string {
-		const baseUrl = this.resolvePublicBaseUrl();
-		const url = new URL(`${baseUrl}/v1/auth/${action}`);
-		url.searchParams.set("token", token);
-
-		if (emailLinkContext?.channel === "app") {
-			url.searchParams.set("client", "app");
-			url.searchParams.set("redirect_uri", this.resolveAppRedirectUri(emailLinkContext.redirectUri));
-		}
-
-		return url.toString();
-	}
-
-	private resolveAppRedirectUri(redirectUri?: string): string {
-		const fallback = "maimaid://auth/callback";
-		const trimmed = redirectUri?.trim() ?? "";
-		if (!trimmed) {
-			return fallback;
-		}
-
-		try {
-			const parsed = new URL(trimmed);
-			const isAllowedRedirect =
-				parsed.protocol === "maimaid:" &&
-				parsed.hostname === "auth" &&
-				(parsed.pathname === "/callback" || parsed.pathname === "/callback/") &&
-				!parsed.search &&
-				!parsed.hash;
-
-			if (isAllowedRedirect) {
-				return fallback;
-			}
-		} catch {
-			// Fallback to the default app callback URL.
-		}
-
-		return fallback;
-	}
+  constructor(
+    @inject(TOKENS.Database) readonly db: Database,
+    @inject(JwtService) private readonly jwt: JwtService,
+    @inject(TOKENS.Env) readonly env: Env,
+  ) {}
+
+  async findActiveUserById(id: string): Promise<User> {
+    const user = await this.db.get<User>(
+      "SELECT * FROM users WHERE id = ?",
+      id,
+    );
+    if (!user || user.status !== "active")
+      throw new AppError(401, "invalid_credentials", "User is not active.");
+    return normalizeUser(user);
+  }
+  private async byEmail(email: string) {
+    const row = await this.db.get<User>(
+      "SELECT * FROM users WHERE email = ?",
+      email.trim().toLowerCase(),
+    );
+    return row ? normalizeUser(row) : null;
+  }
+  async findActiveVerifiedUserByEmail(email: string) {
+    const user = await this.byEmail(email);
+    if (!user || user.status !== "active")
+      throw new AppError(
+        401,
+        "invalid_credentials",
+        "Email or password is incorrect.",
+      );
+    this.requireVerified(user);
+    return user;
+  }
+  private requireVerified(user: User) {
+    if (!user.emailVerifiedAt)
+      throw new AppError(
+        403,
+        "email_not_verified",
+        "Email is not verified. Please check your inbox.",
+      );
+  }
+  async validateLoginCredentials(email: string, password: string) {
+    const user = await this.byEmail(email);
+    if (!user || user.status !== "active")
+      throw new AppError(
+        401,
+        "invalid_credentials",
+        "Email or password is incorrect.",
+      );
+    if (user.opaqueRegistrationRecord || !user.passwordHash)
+      throw new AppError(
+        400,
+        "opaque_required",
+        "This account requires OPAQUE.",
+      );
+    if (!(await compare(password, user.passwordHash)))
+      throw new AppError(
+        401,
+        "invalid_credentials",
+        "Email or password is incorrect.",
+      );
+    this.requireVerified(user);
+    return user;
+  }
+  async startOpaqueRegistration(email: string, registrationRequest: string) {
+    email = email.trim().toLowerCase();
+    if (await this.byEmail(email))
+      throw new AppError(409, "email_exists", "Email already exists.");
+    return {
+      registrationResponse: await createOpaqueRegistrationResponse({
+        serverSetup: this.env.OPAQUE_SERVER_SETUP,
+        userIdentifier: email,
+        registrationRequest,
+      }),
+    };
+  }
+  async createUser(
+    email: string,
+    username: string,
+    registrationRecord: string,
+    passwordFingerprint: string,
+  ) {
+    email = email.trim().toLowerCase();
+    const name = sanitizeUsername(username);
+    const record = normalizeOpaqueEnvelope(registrationRecord);
+    const fingerprint = await hashPasswordFingerprint(passwordFingerprint);
+    // Select a free discriminator and insert in one statement; the UNIQUE constraint is authoritative.
+    const id = crypto.randomUUID(),
+      now = nowISO();
+    try {
+      await this.db.run(
+        `WITH RECURSIVE slots(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM slots WHERE n<9999)
+        INSERT INTO users(id,email,username,usernameNormalized,usernameDiscriminator,opaqueRegistrationRecord,passwordFingerprintHash,createdAt,updatedAt)
+        SELECT ?,?,?,?,printf('%04d',n),?,?,?,? FROM slots
+        WHERE NOT EXISTS(SELECT 1 FROM users WHERE usernameNormalized=? AND usernameDiscriminator=printf('%04d',n)) LIMIT 1`,
+        id,
+        email,
+        name.username,
+        name.usernameNormalized,
+        record,
+        fingerprint,
+        now,
+        now,
+        name.usernameNormalized,
+      );
+    } catch (error) {
+      if (await this.byEmail(email))
+        throw new AppError(409, "email_exists", "Email already exists.");
+      throw error;
+    }
+    const row = await this.db.get<User>("SELECT * FROM users WHERE id=?", id);
+    if (!row)
+      throw new AppError(
+        409,
+        "username_slots_exhausted",
+        "This username has no discriminator slots left.",
+      );
+    return normalizeUser(row);
+  }
+  async finishOpaqueRegistration(
+    email: string,
+    username: string,
+    registrationRecord: string,
+    passwordFingerprint: string,
+    context?: AuthEmailLinkContext,
+  ) {
+    const user = await this.createUser(
+      email,
+      username,
+      registrationRecord,
+      passwordFingerprint,
+    );
+    return {
+      user,
+      verificationEmailSent: await this.sendAuthEmail(user, "verify", context),
+    };
+  }
+  async startOpaqueLogin(email: string, startLoginRequest: string) {
+    const user = await this.findActiveVerifiedUserByEmail(email);
+    if (!user.opaqueRegistrationRecord)
+      return { protocol: "legacy-bcrypt" as const };
+    const result = await startOpaqueLogin({
+      serverSetup: this.env.OPAQUE_SERVER_SETUP,
+      userIdentifier: user.email,
+      registrationRecord: user.opaqueRegistrationRecord,
+      startLoginRequest,
+    });
+    const challengeToken = await this.createChallenge("opaque", user.id, {
+      serverLoginState: result.serverLoginState,
+    });
+    return {
+      protocol: "opaque" as const,
+      challengeToken,
+      loginResponse: result.loginResponse,
+    };
+  }
+  async finishOpaqueLogin(token: string, finishLoginRequest: string) {
+    const challenge = await this.consumeChallenge(token, "opaque");
+    await finishOpaqueLogin({
+      serverLoginState: JSON.parse(challenge.payload).serverLoginState,
+      finishLoginRequest,
+    });
+    const user = await this.findActiveUserById(challenge.userId!);
+    this.requireVerified(user);
+    return user;
+  }
+  async startPasswordEnrollmentOpaque(
+    userId: string,
+    registrationRequest: string,
+  ) {
+    const user = await this.findActiveUserById(userId);
+    return {
+      registrationResponse: await createOpaqueRegistrationResponse({
+        serverSetup: this.env.OPAQUE_SERVER_SETUP,
+        userIdentifier: user.email,
+        registrationRequest,
+      }),
+    };
+  }
+  async finishPasswordEnrollmentOpaque(
+    userId: string,
+    registrationRecord: string,
+    passwordFingerprint: string,
+  ) {
+    const user = await this.findActiveUserById(userId),
+      fingerprint = await hashPasswordFingerprint(passwordFingerprint);
+    if (fingerprint === user.passwordFingerprintHash)
+      throw new AppError(
+        400,
+        "password_reused",
+        "New password must differ from the current password.",
+      );
+    await this.setPassword(
+      userId,
+      null,
+      normalizeOpaqueEnvelope(registrationRecord),
+      fingerprint,
+    );
+  }
+  private async setPassword(
+    userId: string,
+    passwordHash: string | null,
+    record: string | null,
+    fingerprint: string | null,
+  ) {
+    const now = nowISO();
+    await this.db.batch([
+      this.db.statement(
+        "UPDATE users SET passwordHash=?,opaqueRegistrationRecord=?,passwordFingerprintHash=?,authVersion=authVersion+1,updatedAt=? WHERE id=?",
+        passwordHash,
+        record,
+        fingerprint,
+        now,
+        userId,
+      ),
+      this.db.statement(
+        "UPDATE refresh_tokens SET revokedAt=? WHERE userId=? AND revokedAt IS NULL",
+        now,
+        userId,
+      ),
+      this.db.statement(
+        "UPDATE auth_challenges SET consumedAt=? WHERE userId=? AND consumedAt IS NULL",
+        now,
+        userId,
+      ),
+    ]);
+  }
+  async updateUsername(userId: string, username: string) {
+    const user = await this.findActiveUserById(userId),
+      name = sanitizeUsername(username);
+    if (user.usernameNormalized === name.usernameNormalized)
+      await this.db.run(
+        "UPDATE users SET username=?,updatedAt=? WHERE id=?",
+        name.username,
+        nowISO(),
+        userId,
+      );
+    else {
+      const result = await this.db.get<User>(
+        `WITH RECURSIVE slots(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM slots WHERE n<9999)
+        UPDATE users SET username=?,usernameNormalized=?,updatedAt=?,usernameDiscriminator=(SELECT printf('%04d',n) FROM slots WHERE NOT EXISTS(SELECT 1 FROM users WHERE usernameNormalized=? AND usernameDiscriminator=printf('%04d',n)) LIMIT 1)
+        WHERE id=? AND EXISTS(SELECT 1 FROM slots WHERE NOT EXISTS(SELECT 1 FROM users WHERE usernameNormalized=? AND usernameDiscriminator=printf('%04d',n))) RETURNING *`,
+        name.username,
+        name.usernameNormalized,
+        nowISO(),
+        name.usernameNormalized,
+        userId,
+        name.usernameNormalized,
+      );
+      if (!result)
+        throw new AppError(
+          409,
+          "username_slots_exhausted",
+          "No available username slot.",
+        );
+    }
+    return this.findActiveUserById(userId);
+  }
+  async createChallenge(
+    kind: string,
+    userId: string | null,
+    payload: unknown,
+    ttlSeconds = this.env.MFA_CHALLENGE_TTL_SECONDS,
+  ) {
+    const token = randomToken(36),
+      now = nowISO();
+    await this.db.run(
+      "INSERT INTO auth_challenges(id,userId,kind,tokenHash,payload,expiresAt,createdAt) VALUES(?,?,?,?,?,?,?)",
+      crypto.randomUUID(),
+      userId,
+      kind,
+      await sha256Hex(token),
+      JSON.stringify(payload),
+      new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+      now,
+    );
+    return token;
+  }
+  async getChallenge(token: string, kind: string) {
+    const row = await this.db.get<Challenge>(
+      "SELECT * FROM auth_challenges WHERE tokenHash=? AND kind=? AND consumedAt IS NULL AND expiresAt>?",
+      await sha256Hex(token),
+      kind,
+      nowISO(),
+    );
+    if (!row)
+      throw new AppError(
+        400,
+        "invalid_challenge",
+        "Challenge is expired or already used.",
+      );
+    return row;
+  }
+  async consumeChallenge(token: string, kind: string) {
+    const now = nowISO();
+    const row = await this.db.get<Challenge>(
+      "UPDATE auth_challenges SET consumedAt=? WHERE tokenHash=? AND kind=? AND consumedAt IS NULL AND expiresAt>? RETURNING *",
+      now,
+      await sha256Hex(token),
+      kind,
+      now,
+    );
+    if (!row)
+      throw new AppError(
+        400,
+        "invalid_challenge",
+        "Challenge is expired or already used.",
+      );
+    return row;
+  }
+  async consumeChallengeId(id: string) {
+    const now = nowISO();
+    const result = await this.db.run(
+      "UPDATE auth_challenges SET consumedAt=? WHERE id=? AND consumedAt IS NULL AND expiresAt>?",
+      now,
+      id,
+      now,
+    );
+    if (result.meta.changes !== 1)
+      throw new AppError(
+        400,
+        "invalid_challenge",
+        "Challenge is expired or already used.",
+      );
+  }
+  async issueTokensForUser(user: User) {
+    const accessToken = await this.jwt.signAccessToken({
+      sub: user.id,
+      email: user.email,
+      isAdmin: user.isAdmin,
+      authVersion: user.authVersion,
+    });
+    const refreshToken = randomToken();
+    await this.db.run(
+      "INSERT INTO refresh_tokens(id,userId,tokenHash,expiresAt,createdAt) VALUES(?,?,?,?,?)",
+      crypto.randomUUID(),
+      user.id,
+      await sha256Hex(refreshToken),
+      new Date(
+        Date.now() + this.env.JWT_REFRESH_TTL_SECONDS * 1000,
+      ).toISOString(),
+      nowISO(),
+    );
+    return {
+      accessToken,
+      refreshToken,
+      expiresIn: this.env.JWT_ACCESS_TTL_SECONDS,
+    };
+  }
+  async refresh(token: string) {
+    const now = nowISO();
+    const row = await this.db.get<{ userId: string }>(
+      "UPDATE refresh_tokens SET revokedAt=? WHERE tokenHash=? AND revokedAt IS NULL AND expiresAt>? RETURNING userId",
+      now,
+      await sha256Hex(token),
+      now,
+    );
+    if (!row)
+      throw new AppError(
+        401,
+        "invalid_refresh_token",
+        "Invalid refresh token.",
+      );
+    const user = await this.findActiveUserById(row.userId);
+    return { user, tokens: await this.issueTokensForUser(user) };
+  }
+  async logout(token: string) {
+    await this.db.run(
+      "UPDATE refresh_tokens SET revokedAt=? WHERE tokenHash=? AND revokedAt IS NULL",
+      nowISO(),
+      await sha256Hex(token),
+    );
+  }
+  async createSessionCodeForUser(userId: string, request: AppAuthorization) {
+    if (
+      APP_CALLBACKS[request.clientId] !== request.redirectUri ||
+      !/^[A-Za-z0-9_-]{43}$/.test(request.codeChallenge)
+    )
+      throw new AppError(
+        400,
+        "invalid_authorization",
+        "Invalid application authorization.",
+      );
+    return this.createChallenge("app_code", userId, request, 120);
+  }
+  async exchangeSessionCode(code: string, request: AppExchange) {
+    const challenge = await this.getChallenge(code, "app_code");
+    const expected = JSON.parse(challenge.payload) as AppAuthorization;
+    if (!/^[A-Za-z0-9._~-]{43,128}$/.test(request.codeVerifier))
+      throw new AppError(400, "invalid_pkce", "Invalid code verifier.");
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(request.codeVerifier),
+    );
+    const actual = Buffer.from(digest).toString("base64url");
+    if (
+      expected.clientId !== request.clientId ||
+      expected.redirectUri !== request.redirectUri ||
+      expected.codeChallenge !== actual
+    )
+      throw new AppError(
+        400,
+        "invalid_pkce",
+        "Authorization binding does not match.",
+      );
+    await this.consumeChallengeId(challenge.id);
+    const user = await this.findActiveUserById(challenge.userId!);
+    this.requireVerified(user);
+    return { user, tokens: await this.issueTokensForUser(user) };
+  }
+  async resendVerification(email: string, context?: AuthEmailLinkContext) {
+    const user = await this.byEmail(email);
+    return {
+      verificationEmailSent:
+        !user ||
+        Boolean(user.emailVerifiedAt) ||
+        (await this.sendAuthEmail(user, "verify", context)),
+    };
+  }
+  async verifyEmail(token: string) {
+    const row = await this.consumeChallenge(token, "verify");
+    await this.db.run(
+      "UPDATE users SET emailVerifiedAt=?,updatedAt=? WHERE id=?",
+      nowISO(),
+      nowISO(),
+      row.userId!,
+    );
+    return this.findActiveUserById(row.userId!);
+  }
+  async forgotPassword(email: string, context?: AuthEmailLinkContext) {
+    const user = await this.byEmail(email);
+    return {
+      resetEmailSent:
+        !user || (await this.sendAuthEmail(user, "reset", context)),
+    };
+  }
+  async validatePasswordResetToken(token: string) {
+    const row = await this.getChallenge(token, "reset");
+    return { email: (await this.findActiveUserById(row.userId!)).email };
+  }
+  async startOpaquePasswordReset(token: string, registrationRequest: string) {
+    const { email } = await this.validatePasswordResetToken(token);
+    return {
+      email,
+      registrationResponse: await createOpaqueRegistrationResponse({
+        serverSetup: this.env.OPAQUE_SERVER_SETUP,
+        userIdentifier: email,
+        registrationRequest,
+      }),
+    };
+  }
+  async finishOpaquePasswordReset(
+    token: string,
+    registrationRecord: string,
+    passwordFingerprint: string,
+  ) {
+    const challenge = await this.getChallenge(token, "reset");
+    const user = await this.findActiveUserById(challenge.userId!);
+    const fingerprint = await hashPasswordFingerprint(passwordFingerprint),
+      record = normalizeOpaqueEnvelope(registrationRecord);
+    if (fingerprint === user.passwordFingerprintHash)
+      throw new AppError(
+        400,
+        "password_reused",
+        "New password must differ from the current password.",
+      );
+    await this.consumeChallengeId(challenge.id);
+    await this.setPassword(user.id, null, record, fingerprint);
+  }
+  async resetPassword(token: string, password: string) {
+    const challenge = await this.getChallenge(token, "reset"),
+      user = await this.findActiveUserById(challenge.userId!);
+    if (user.opaqueRegistrationRecord)
+      throw new AppError(400, "opaque_required", "Use OPAQUE password reset.");
+    if (!isPasswordComplexEnough(password))
+      throw new AppError(
+        400,
+        "invalid_password",
+        "Password does not meet complexity requirements.",
+      );
+    if (user.passwordHash && (await compare(password, user.passwordHash)))
+      throw new AppError(
+        400,
+        "password_reused",
+        "New password must differ from the current password.",
+      );
+    const passwordHash = await hash(password, 12);
+    await this.consumeChallengeId(challenge.id);
+    await this.setPassword(user.id, passwordHash, null, null);
+  }
+  private async sendAuthEmail(
+    user: User,
+    kind: "verify" | "reset",
+    context?: AuthEmailLinkContext,
+  ) {
+    if (!this.env.RESEND_API_KEY) return false;
+    const token = await this.createChallenge(
+      kind,
+      user.id,
+      {},
+      kind === "verify" ? 3600 : 900,
+    );
+    const url = new URL("/", this.env.APP_PUBLIC_URL);
+    url.searchParams.set(
+      "authAction",
+      kind === "verify" ? "verify-email" : "reset-password",
+    );
+    url.searchParams.set("token", token);
+    if (
+      context?.channel === "app" &&
+      Object.values(APP_CALLBACKS).includes(
+        context.redirectUri as typeof APP_CALLBACKS.maimaid,
+      )
+    ) {
+      url.searchParams.set("client", "app");
+      url.searchParams.set("redirect_uri", context.redirectUri!);
+    }
+    const action =
+      kind === "verify" ? "Verify your email" : "Reset your password";
+    const escaped = url
+      .toString()
+      .replaceAll("&", "&amp;")
+      .replaceAll('"', "&quot;");
+    try {
+      return (
+        await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.env.RESEND_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            from: this.env.RESEND_FROM_EMAIL,
+            to: [user.email],
+            subject: `Rhythmeta — ${action}`,
+            html: `<p>${action}</p><p><a href="${escaped}">${action}</a></p><p>If you did not request this email, you can ignore it.</p>`,
+          }),
+        })
+      ).ok;
+    } catch {
+      return false;
+    }
+  }
 }
