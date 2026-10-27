@@ -2,7 +2,6 @@ import "reflect-metadata";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
-import { Scalar } from "@scalar/hono-api-reference";
 import type { InjectionToken } from "tsyringe";
 import type { AppEnv } from "./types/hono.js";
 import { Database, type Game } from "./db/database.js";
@@ -23,28 +22,44 @@ import { adminV1Route, accountAdminRoute } from "./routes/v1/admin.route.js";
 import { backupRoute } from "./routes/v1/backups.route.js";
 import { isAppError } from "./lib/errors.js";
 
+/**
+ * Resolves services on first use. Building all ten eagerly cost every request
+ * — including `/health`, 404s and CORS preflights — a full env parse and nine
+ * object constructions that it never read.
+ */
 export function services(bindings: AppEnv["Bindings"], game: Game = "maimaid") {
-  const env = parseEnv(bindings),
-    db = new Database(bindings.DB),
-    jwt = new JwtService(env),
-    auth = new AuthService(db, jwt, env);
-  const storage = new StorageService(env, bindings.BACKUP_BUCKET);
-  const map = new Map<InjectionToken<unknown>, unknown>([
-    [TOKENS.Env, env],
-    [TOKENS.Database, db],
-    [JwtService, jwt],
-    [AuthService, auth],
-    [MfaService, new MfaService(db, env, auth)],
-    [RateLimitService, new RateLimitService(db)],
-    [CommunityAliasService, new CommunityAliasService(db, env, game)],
-    [AdminUserService, new AdminUserService(db, auth)],
-    [StorageService, storage],
-    [BackupService, new BackupService(db, storage)],
-  ]);
-  return <T>(key: InjectionToken<T>): T => {
-    if (!map.has(key)) throw new Error("Unknown service");
-    return map.get(key) as T;
+  const instances = new Map<InjectionToken<unknown>, unknown>();
+  let env: Env | undefined;
+  const get = <T>(key: InjectionToken<T>): T => {
+    if (instances.has(key)) return instances.get(key) as T;
+    const value = create(key);
+    instances.set(key, value);
+    return value as T;
   };
+  const create = (key: InjectionToken<unknown>): unknown => {
+    if (key === TOKENS.Env) return (env ??= parseEnv(bindings));
+    if (key === TOKENS.Database) return new Database(bindings.DB);
+    if (key === JwtService) return new JwtService(get(TOKENS.Env));
+    if (key === AuthService)
+      return new AuthService(
+        get(TOKENS.Database),
+        get(JwtService),
+        get(TOKENS.Env),
+      );
+    if (key === MfaService)
+      return new MfaService(get(TOKENS.Database), get(TOKENS.Env), get(AuthService));
+    if (key === RateLimitService) return new RateLimitService(get(TOKENS.Database));
+    if (key === CommunityAliasService)
+      return new CommunityAliasService(get(TOKENS.Database), get(TOKENS.Env), game);
+    if (key === AdminUserService)
+      return new AdminUserService(get(TOKENS.Database), get(AuthService));
+    if (key === StorageService)
+      return new StorageService(get(TOKENS.Env), bindings.BACKUP_BUCKET);
+    if (key === BackupService)
+      return new BackupService(get(TOKENS.Database), get(StorageService));
+    throw new Error("Unknown service");
+  };
+  return get;
 }
 export const createApp = () => {
   const app = new Hono<AppEnv>();
@@ -139,8 +154,11 @@ export const registerOpenApiRoutes = (
   document: unknown,
 ) => {
   app.get("/openapi.json", (c) => c.json(document as object));
-  app.get(
-    "/docs",
-    Scalar({ url: "/openapi.json", pageTitle: "Rhythmeta API" }),
+  // The Scalar renderer is ~107 KB of bundle that only /docs ever reads, so it
+  // loads from a CDN here instead of being inlined into the Worker.
+  app.get("/docs", (c) =>
+    c.html(
+      `<!doctype html><html><head><meta charset="utf-8"><title>Rhythmeta API</title></head><body><script id="api-reference" data-url="/openapi.json"></script><script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script></body></html>`,
+    ),
   );
 };
